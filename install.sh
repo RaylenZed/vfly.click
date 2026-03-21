@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # =========================================================
-# Multi-Protocol Manager V3.2
+# Multi-Protocol Manager V3.3
 # =========================================================
 
 # --- 颜色定义 ---
@@ -18,6 +18,8 @@ TRAFFIC_CONF="/etc/vps-traffic.conf"
 DEFAULT_QUOTA_GB=2048  # 2TB
 
 # --- 路径定义 ---
+TRAFFIC_WEB_DIR="/opt/vps-traffic-web"
+TRAFFIC_WEB_PORT=19999
 XRAY_BIN="/usr/local/bin/xray"
 XRAY_CONF="/usr/local/etc/xray/config.json"
 HY2_CONF="/etc/hysteria/config.yaml"
@@ -586,13 +588,344 @@ enable_bbr() {
     echo -e "当前状态: ${GREEN}$RESULT${NC}"
 }
 
+# --- 6. Web 流量面板 ---
+
+_web_write_server() {
+    local iface="$1" quota_gb="$2" reset_day="$3" alert_pct="$4" token="$5"
+    mkdir -p "$TRAFFIC_WEB_DIR"
+    cat > "$TRAFFIC_WEB_DIR/server.py" <<PYEOF
+#!/usr/bin/env python3
+import http.server, json, subprocess, os, datetime, urllib.parse, html
+
+IFACE      = "${iface}"
+QUOTA_GB   = ${quota_gb}
+RESET_DAY  = ${reset_day}
+ALERT_PCT  = ${alert_pct}
+TOKEN      = "${token}"
+PORT       = ${TRAFFIC_WEB_PORT}
+
+def vnstat_json(mode):
+    try:
+        r = subprocess.run(["vnstat", "-i", IFACE, "--json", mode],
+                           capture_output=True, text=True, timeout=10)
+        return json.loads(r.stdout)
+    except Exception:
+        return {}
+
+def fmt(b):
+    if b >= 1099511627776: return f"{b/1099511627776:.2f} TB"
+    if b >= 1073741824:    return f"{b/1073741824:.2f} GB"
+    if b >= 1048576:       return f"{b/1048576:.2f} MB"
+    if b >= 1024:          return f"{b/1024:.2f} KB"
+    return f"{b} B"
+
+def get_month_data():
+    d = vnstat_json("m")
+    try:
+        months = d["interfaces"][0]["traffic"]["month"]
+        cur = months[-1]
+        return cur.get("rx", 0), cur.get("tx", 0)
+    except Exception:
+        return 0, 0
+
+def get_day_data(n=30):
+    d = vnstat_json("d")
+    try:
+        days = d["interfaces"][0]["traffic"]["day"][-n:]
+        result = []
+        for day in days:
+            label = f"{day['date']['year']}-{day['date']['month']:02d}-{day['date']['day']:02d}"
+            result.append({"date": label, "rx": day.get("rx", 0), "tx": day.get("tx", 0)})
+        return result
+    except Exception:
+        return []
+
+def get_all_months():
+    d = vnstat_json("m")
+    try:
+        months = d["interfaces"][0]["traffic"]["month"]
+        result = []
+        for m in months:
+            label = f"{m['date']['year']}-{m['date']['month']:02d}"
+            result.append({"month": label, "rx": m.get("rx", 0), "tx": m.get("tx", 0)})
+        return result
+    except Exception:
+        return []
+
+HTML = r"""<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>VPS 流量监控</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js"></script>
+<style>
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{background:#0f172a;color:#e2e8f0;font-family:'Segoe UI',system-ui,sans-serif;padding:20px}
+  h1{text-align:center;font-size:1.5rem;margin-bottom:24px;color:#f8fafc}
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:16px;margin-bottom:24px}
+  .card{background:#1e293b;border-radius:12px;padding:20px}
+  .card h2{font-size:.85rem;color:#94a3b8;text-transform:uppercase;letter-spacing:.08em;margin-bottom:12px}
+  .big{font-size:2rem;font-weight:700;color:#f1f5f9}
+  .sub{font-size:.8rem;color:#64748b;margin-top:4px}
+  .bar-wrap{background:#0f172a;border-radius:999px;height:10px;margin:10px 0}
+  .bar{height:10px;border-radius:999px;transition:width .5s}
+  .bar.green{background:linear-gradient(90deg,#22c55e,#4ade80)}
+  .bar.yellow{background:linear-gradient(90deg,#eab308,#facc15)}
+  .bar.red{background:linear-gradient(90deg,#ef4444,#f87171)}
+  .stat-row{display:flex;justify-content:space-between;font-size:.85rem;margin-top:6px;color:#94a3b8}
+  .stat-val{color:#e2e8f0;font-weight:600}
+  .chart-card{background:#1e293b;border-radius:12px;padding:20px;margin-bottom:16px}
+  .chart-card h2{font-size:.85rem;color:#94a3b8;text-transform:uppercase;letter-spacing:.08em;margin-bottom:16px}
+  .footer{text-align:center;font-size:.75rem;color:#334155;margin-top:24px}
+  .badge{display:inline-block;padding:2px 8px;border-radius:999px;font-size:.75rem;font-weight:600}
+  .badge.ok{background:#166534;color:#86efac}
+  .badge.warn{background:#713f12;color:#fde68a}
+  .badge.crit{background:#7f1d1d;color:#fca5a5}
+  @media(max-width:600px){.big{font-size:1.5rem}}
+</style>
+</head>
+<body>
+<h1>🖥️ VPS 流量监控</h1>
+<div id="app"><div style="text-align:center;color:#475569;padding:60px">加载中...</div></div>
+<div class="footer">自动刷新 · <span id="ts"></span></div>
+<script>
+const fmt = b => {
+  if(b>=1099511627776) return (b/1099511627776).toFixed(2)+' TB';
+  if(b>=1073741824)    return (b/1073741824).toFixed(2)+' GB';
+  if(b>=1048576)       return (b/1048576).toFixed(2)+' MB';
+  if(b>=1024)          return (b/1024).toFixed(2)+' KB';
+  return b+' B';
+};
+let dayChart=null, monChart=null;
+async function load(){
+  const r = await fetch('REPLACE_API_URL').catch(()=>null);
+  if(!r||!r.ok){document.getElementById('app').innerHTML='<div style="text-align:center;color:#ef4444;padding:60px">数据加载失败</div>';return;}
+  const d = await r.json();
+  const {rx,tx,quota_gb,alert_pct,used_pct,remain,days,months,iface} = d;
+  const total = rx+tx;
+  const barCls = used_pct>=90?'red':used_pct>=alert_pct?'yellow':'green';
+  const badgeCls = used_pct>=90?'crit':used_pct>=alert_pct?'warn':'ok';
+  const badgeTxt = used_pct>=90?'⚠ 严重':used_pct>=alert_pct?'⚠ 告警':'✓ 正常';
+  document.getElementById('app').innerHTML = \`
+  <div class="grid">
+    <div class="card">
+      <h2>本月合计 <span class="badge \${badgeCls}">\${badgeTxt}</span></h2>
+      <div class="big">\${fmt(total)}</div>
+      <div class="sub">接口: \${iface}</div>
+      <div class="bar-wrap"><div class="bar \${barCls}" style="width:\${Math.min(used_pct,100)}%"></div></div>
+      <div class="stat-row"><span>已用 \${used_pct}%</span><span class="stat-val">剩余 \${fmt(remain)}</span></div>
+      <div class="stat-row"><span>配额</span><span class="stat-val">\${quota_gb} GB</span></div>
+    </div>
+    <div class="card">
+      <h2>上传 / 下载</h2>
+      <div class="big">\${fmt(tx)}</div><div class="sub">↑ 上传</div>
+      <div style="margin-top:14px"><div class="big">\${fmt(rx)}</div><div class="sub">↓ 下载</div></div>
+    </div>
+    <div class="card">
+      <h2>今日用量</h2>
+      <div class="big">\${days.length?fmt(days[days.length-1].rx+days[days.length-1].tx):'--'}</div>
+      <div class="sub">↑ \${days.length?fmt(days[days.length-1].tx):'--'} &nbsp; ↓ \${days.length?fmt(days[days.length-1].rx):'--'}</div>
+    </div>
+  </div>
+  <div class="chart-card"><h2>近 30 天日流量</h2><canvas id="dayChart" height="80"></canvas></div>
+  <div class="chart-card"><h2>月度流量历史</h2><canvas id="monChart" height="80"></canvas></div>
+  \`;
+
+  if(dayChart){dayChart.destroy();dayChart=null;}
+  if(monChart){monChart.destroy();monChart=null;}
+
+  const dLabels=days.map(d=>d.date.slice(5));
+  dayChart=new Chart(document.getElementById('dayChart'),{type:'bar',data:{labels:dLabels,datasets:[
+    {label:'上传',data:days.map(d=>+(d.tx/1073741824).toFixed(3)),backgroundColor:'rgba(99,102,241,.7)',borderRadius:3},
+    {label:'下载',data:days.map(d=>+(d.rx/1073741824).toFixed(3)),backgroundColor:'rgba(34,197,94,.7)',borderRadius:3}
+  ]},options:{plugins:{legend:{labels:{color:'#94a3b8'}}},scales:{x:{ticks:{color:'#64748b',maxRotation:45}},y:{ticks:{color:'#64748b',callback:v=>v+'GB'}}}}});
+
+  const mLabels=months.map(m=>m.month);
+  monChart=new Chart(document.getElementById('monChart'),{type:'bar',data:{labels:mLabels,datasets:[
+    {label:'上传',data:months.map(m=>+(m.tx/1073741824).toFixed(3)),backgroundColor:'rgba(99,102,241,.7)',borderRadius:3},
+    {label:'下载',data:months.map(m=>+(m.rx/1073741824).toFixed(3)),backgroundColor:'rgba(34,197,94,.7)',borderRadius:3}
+  ]},options:{plugins:{legend:{labels:{color:'#94a3b8'}}},scales:{x:{ticks:{color:'#64748b'}},y:{ticks:{color:'#64748b',callback:v=>v+'GB'}}}}});
+
+  document.getElementById('ts').textContent=new Date().toLocaleString('zh-CN');
+}
+load();
+setInterval(load,60000);
+</script>
+</body></html>
+"""
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    def log_message(self, fmt, *args): pass
+
+    def do_GET(self):
+        parsed = urllib.parse.urlparse(self.path)
+        qs = urllib.parse.parse_qs(parsed.query)
+
+        # token 验证
+        if TOKEN and qs.get("token", [""])[0] != TOKEN:
+            self.send_response(401)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(b"<html><body style='background:#0f172a;color:#e2e8f0;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;'><h2>401 - Access Denied</h2></body></html>")
+            return
+
+        if parsed.path == "/api":
+            self._api()
+        else:
+            self._index()
+
+    def _index(self):
+        qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+        token_param = ("?token=" + TOKEN) if TOKEN else ""
+        page = HTML.replace("REPLACE_API_URL", f"/api{token_param}")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(page.encode())
+
+    def _api(self):
+        rx, tx = get_month_data()
+        total = rx + tx
+        quota_bytes = QUOTA_GB * 1024**3
+        used_pct = int(total * 100 / quota_bytes) if quota_bytes else 0
+        remain = max(quota_bytes - total, 0)
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        data = {
+            "iface": IFACE, "rx": rx, "tx": tx,
+            "quota_gb": QUOTA_GB, "alert_pct": ALERT_PCT,
+            "used_pct": used_pct, "remain": remain,
+            "days": get_day_data(30),
+            "months": get_all_months(),
+        }
+        self.wfile.write(json.dumps(data).encode())
+
+if __name__ == "__main__":
+    server = http.server.HTTPServer(("0.0.0.0", PORT), Handler)
+    print(f"VPS Traffic Web running on :{PORT}")
+    server.serve_forever()
+PYEOF
+}
+
+_web_write_service() {
+    cat > /etc/systemd/system/vps-traffic-web.service <<EOF
+[Unit]
+Description=VPS Traffic Web Dashboard
+After=network.target vnstat.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 ${TRAFFIC_WEB_DIR}/server.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload
+}
+
+traffic_web_install() {
+    _traffic_install_vnstat
+    _traffic_load_conf
+
+    local iface
+    iface=$(_traffic_get_iface)
+    if [[ -z "$iface" ]]; then
+        echo -e "${RED}无法检测网络接口${NC}"; return
+    fi
+
+    echo -e "\n${YELLOW}=== 安装 Web 流量面板 ===${NC}"
+    echo -e "接口: ${CYAN}${iface}${NC}  配额: ${QUOTA_GB}GB  重置日: ${RESET_DAY}日"
+    echo ""
+
+    local token
+    read -p "访问密码 (回车自动生成): " token
+    if [[ -z "$token" ]]; then
+        token=$(openssl rand -hex 8)
+        echo -e "${YELLOW}自动生成密码: ${CYAN}${token}${NC}"
+    fi
+
+    read -p "Web 端口 [默认: ${TRAFFIC_WEB_PORT}]: " input_port
+    [[ -n "$input_port" ]] && TRAFFIC_WEB_PORT="$input_port"
+
+    _web_write_server "$iface" "$QUOTA_GB" "$RESET_DAY" "$ALERT_PCT" "$token"
+    _web_write_service
+
+    # 保存 token 到配置
+    grep -q "^WEB_TOKEN=" "$TRAFFIC_CONF" 2>/dev/null && \
+        sed -i "s/^WEB_TOKEN=.*/WEB_TOKEN=${token}/" "$TRAFFIC_CONF" || \
+        echo "WEB_TOKEN=${token}" >> "$TRAFFIC_CONF"
+    grep -q "^WEB_PORT=" "$TRAFFIC_CONF" 2>/dev/null && \
+        sed -i "s/^WEB_PORT=.*/WEB_PORT=${TRAFFIC_WEB_PORT}/" "$TRAFFIC_CONF" || \
+        echo "WEB_PORT=${TRAFFIC_WEB_PORT}" >> "$TRAFFIC_CONF"
+
+    systemctl enable vps-traffic-web --now
+
+    local ip
+    ip=$(get_ip)
+    echo -e "\n${GREEN}✓ Web 面板已启动！${NC}"
+    echo -e "${BOLD}访问地址:${NC}"
+    echo -e "  ${CYAN}http://${ip}:${TRAFFIC_WEB_PORT}/?token=${token}${NC}"
+    echo ""
+    echo -e "${YELLOW}提示：建议用 nginx 反代并套 TLS 以避免明文传输密码。${NC}"
+}
+
+traffic_web_show_url() {
+    _traffic_load_conf
+    local ip token port
+    ip=$(get_ip)
+    token="${WEB_TOKEN:-}"
+    port="${WEB_PORT:-${TRAFFIC_WEB_PORT}}"
+    if [[ -z "$token" ]]; then
+        echo -e "${RED}Web 面板未安装，请先选择「安装 Web 面板」${NC}"
+        return
+    fi
+    echo -e "\n${YELLOW}=== Web 面板访问信息 ===${NC}"
+    echo -e "地址: ${CYAN}http://${ip}:${port}/?token=${token}${NC}"
+    echo -e "状态: $(check_status vps-traffic-web)"
+}
+
+traffic_web_remove() {
+    systemctl disable vps-traffic-web --now 2>/dev/null
+    rm -f /etc/systemd/system/vps-traffic-web.service
+    rm -rf "$TRAFFIC_WEB_DIR"
+    systemctl daemon-reload
+    echo -e "${GREEN}Web 面板已卸载。${NC}"
+}
+
+manage_traffic_web_menu() {
+    while true; do
+        echo -e "\n${BLUE}--- Web 流量面板 ---${NC}"
+        echo -e "1. 安装/重装 Web 面板"
+        echo -e "2. 查看访问地址"
+        echo -e "3. 重启服务"
+        echo -e "4. 查看日志"
+        echo -e "5. 卸载 Web 面板"
+        echo -e "0. 返回"
+        read -p "请选择: " OPT
+        case $OPT in
+            1) traffic_web_install ;;
+            2) traffic_web_show_url ;;
+            3) systemctl restart vps-traffic-web && echo "已重启" ;;
+            4) journalctl -u vps-traffic-web -n 30 --no-pager ;;
+            5) traffic_web_remove ;;
+            0) break ;;
+            *) echo "无效选择" ;;
+        esac
+    done
+}
+
 # --- 主菜单 ---
 
 main_menu() {
     while true; do
         clear
         echo -e "${BLUE}=====================================${NC}"
-        echo -e "   全能协议管理脚本 V3.2"
+        echo -e "   全能协议管理脚本 V3.3"
         echo -e "${BLUE}=====================================${NC}"
         echo -e "1. 安装/重置 Reality (TCP 443)  [$(check_status xray)]"
         echo -e "2. 安装/重置 Hysteria2 (UDP 443)[$(check_status hysteria-server)]"
@@ -603,7 +936,8 @@ main_menu() {
         echo -e "6. 管理 Snell"
         echo -e "-------------------------------------"
         echo -e "7. 开启 BBR 加速"
-        echo -e "8. 流量监控"
+        echo -e "8. 流量监控 (命令行)"
+        echo -e "9. Web 流量面板"
         echo -e "0. 退出脚本"
         echo -e "${BLUE}=====================================${NC}"
         read -p "请输入选项: " CHOICE
@@ -617,6 +951,7 @@ main_menu() {
             6) manage_snell_menu; read -p "按回车继续..." ;;
             7) enable_bbr; read -p "按回车继续..." ;;
             8) manage_traffic_menu ;;
+            9) manage_traffic_web_menu ;;
             0) exit 0 ;;
             *) echo "无效选项"; sleep 1 ;;
         esac
