@@ -27,6 +27,46 @@ SNELL_CONF="/etc/snell/snell-server.conf"
 
 # --- 基础函数 ---
 
+# 通用端口选择函数，结果存入全局变量 SELECTED_PORT
+select_port() {
+    local service_name="${1:-服务}"
+    local default_random_min="${2:-10000}"
+    local default_random_max="${3:-65535}"
+
+    echo -e "\n${YELLOW}--- 端口选择 (${service_name}) ---${NC}"
+    echo -e "  ${CYAN}1.${NC} 使用 443 端口 ${YELLOW}(最佳隐蔽性，流量混入 HTTPS)${NC}"
+    echo -e "  ${CYAN}2.${NC} 随机端口 ${YELLOW}(${default_random_min}-${default_random_max}，避开常用端口)${NC}"
+    echo -e "  ${CYAN}3.${NC} 手动输入端口"
+    read -p "请选择 [1/2/3，默认 1]: " PORT_OPT
+    [[ -z "$PORT_OPT" ]] && PORT_OPT=1
+
+    case $PORT_OPT in
+        1)
+            SELECTED_PORT=443
+            echo -e "${GREEN}使用 443 端口${NC}"
+            ;;
+        2)
+            SELECTED_PORT=$(( RANDOM % (default_random_max - default_random_min + 1) + default_random_min ))
+            echo -e "${GREEN}随机端口: ${SELECTED_PORT}${NC}"
+            ;;
+        3)
+            while true; do
+                read -p "请输入端口 (1-65535): " SELECTED_PORT
+                if [[ "$SELECTED_PORT" =~ ^[0-9]+$ ]] && (( SELECTED_PORT >= 1 && SELECTED_PORT <= 65535 )); then
+                    echo -e "${GREEN}使用端口: ${SELECTED_PORT}${NC}"
+                    break
+                else
+                    echo -e "${RED}无效端口，请重新输入${NC}"
+                fi
+            done
+            ;;
+        *)
+            SELECTED_PORT=443
+            echo -e "${YELLOW}无效选择，默认使用 443${NC}"
+            ;;
+    esac
+}
+
 check_root() {
     [[ $EUID -ne 0 ]] && { echo -e "${RED}请使用 sudo -i 切换到 root 用户后运行！${NC}"; exit 1; }
 }
@@ -64,6 +104,11 @@ install_reality() {
     
     mkdir -p /usr/local/etc/xray
     
+    select_port "VLESS Reality"
+
+    echo -e "${YELLOW}提示：443 端口让流量看起来像正常 HTTPS，隐蔽性最好；${NC}"
+    echo -e "${YELLOW}      其他端口功能完全正常，但可能更容易被识别为代理流量。${NC}"
+
     read -p "请输入伪装域名 (SNI) [默认: griffithobservatory.org]: " SNI
     [[ -z "$SNI" ]] && SNI="griffithobservatory.org"
 
@@ -123,7 +168,7 @@ install_reality() {
   },
   "inbounds": [
     {
-      "port": 443,
+      "port": $SELECTED_PORT,
       "protocol": "vless",
       "settings": {
         "clients": [
@@ -135,7 +180,7 @@ install_reality() {
         "network": "tcp",
         "security": "reality",
         "realitySettings": {
-          "dest": "$SNI:443",
+          "dest": "$SNI:$SELECTED_PORT",
           "serverNames": ["$SNI"],
           "privateKey": "$PK",
           "shortIds": ["$SID"]
@@ -175,22 +220,24 @@ EOF
 
 view_reality() {
     if [[ ! -f $XRAY_CONF ]]; then echo -e "${RED}未找到配置文件${NC}"; return; fi
-    
+
     IP=$(get_ip)
+    PORT=$(jq -r '.inbounds[0].port' $XRAY_CONF)
     UUID=$(jq -r '.inbounds[0].settings.clients[0].id' $XRAY_CONF)
     SNI=$(jq -r '.inbounds[0].streamSettings.realitySettings.serverNames[0]' $XRAY_CONF)
     SID=$(jq -r '.inbounds[0].streamSettings.realitySettings.shortIds[0]' $XRAY_CONF)
-    
+
     # 尝试读取保存的公钥
     if [[ -f /usr/local/etc/xray/public.key ]]; then
         PUB=$(cat /usr/local/etc/xray/public.key)
     else
         PUB="未找到公钥文件，请重置"
     fi
-    
-    LINK="vless://${UUID}@${IP}:443?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=chrome&pbk=${PUB}&sid=${SID}&type=tcp&headerType=none#Reality_Vision"
+
+    LINK="vless://${UUID}@${IP}:${PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=chrome&pbk=${PUB}&sid=${SID}&type=tcp&headerType=none#Reality_Vision"
     
     echo -e "\n${YELLOW}=== Reality 配置信息 ===${NC}"
+    echo -e "端口: $PORT"
     echo -e "SNI: $SNI"
     echo -e "UUID: $UUID"
     echo -e "Public Key: $PUB"
@@ -229,13 +276,15 @@ install_hy2() {
     LATEST=$(curl -s https://api.github.com/repos/apernet/hysteria/releases/latest | grep "tag_name" | cut -d '"' -f 4)
     wget -O /usr/local/bin/hysteria_server "https://github.com/apernet/hysteria/releases/download/${LATEST}/hysteria-linux-${HY_ARCH}"
     chmod +x /usr/local/bin/hysteria_server
-    
+
+    select_port "Hysteria 2 (UDP)"
+
     mkdir -p /etc/hysteria
     openssl req -x509 -nodes -newkey rsa:2048 -keyout /etc/hysteria/server.key -out /etc/hysteria/server.crt -days 3650 -subj "/CN=bing.com" 2>/dev/null
     PASS=$(openssl rand -base64 16)
-    
+
     cat > $HY2_CONF <<EOF
-listen: :443
+listen: :$SELECTED_PORT
 tls:
   cert: /etc/hysteria/server.crt
   key: /etc/hysteria/server.key
@@ -269,11 +318,13 @@ view_hy2() {
     if [[ ! -f $HY2_CONF ]]; then echo -e "${RED}未找到配置${NC}"; return; fi
     IP=$(get_ip)
     PASS=$(grep "password:" $HY2_CONF | awk '{print $2}')
-    LINK="hysteria2://${PASS}@${IP}:443?insecure=1&sni=bing.com#Hysteria2"
-    
+    PORT=$(grep "^listen:" $HY2_CONF | awk -F: '{print $NF}' | tr -d ' ')
+
+    LINK="hysteria2://${PASS}@${IP}:${PORT}?insecure=1&sni=bing.com#Hysteria2"
+
     echo -e "\n${YELLOW}=== Hysteria 2 配置信息 ===${NC}"
     echo -e "密码: $PASS"
-    echo -e "端口: 443 (UDP)"
+    echo -e "端口: ${PORT} (UDP)"
     echo -e "SNI: bing.com"
     echo -e "链接: $LINK"
     echo -e "\n${YELLOW}二维码:${NC}"
@@ -352,7 +403,8 @@ view_snell() {
     if [[ ! -f $SNELL_CONF ]]; then echo -e "${RED}未找到配置${NC}"; return; fi
     IP=$(get_ip)
     PSK=$(grep "psk =" $SNELL_CONF | awk -F'= ' '{print $2}')
-    CONF_LINE="Proxy = snell, ${IP}, 11807, psk=${PSK}, version=5, tfo=true"
+    PORT=$(grep "^listen" $SNELL_CONF | awk -F: '{print $NF}' | tr -d ' ')
+    CONF_LINE="Proxy = snell, ${IP}, ${PORT}, psk=${PSK}, version=5, tfo=true"
     
     echo -e "\n${YELLOW}=== Snell 配置信息 ===${NC}"
     echo -e "PSK: $PSK"
