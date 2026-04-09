@@ -941,8 +941,14 @@ _traffic_install_collector() {
     mkdir -p /var/lib/vps-traffic
     mkdir -p /opt/vps-traffic-web
 
-    cat > /opt/vps-traffic-web/collector.py <<'PYEOF'
+    # Phase A: bash 变量插值
+    cat > /opt/vps-traffic-web/collector.py <<EOF
 #!/usr/bin/env python3
+WEB_PORT = ${TRAFFIC_WEB_PORT}   # 监控面板端口，自动过滤自身流量
+EOF
+
+    # Phase B: 不插值
+    cat >> /opt/vps-traffic-web/collector.py <<'PYEOF'
 """
 VPS 流量采集器 - 双数据源：Xray access.log + conntrack -E
 """
@@ -953,7 +959,7 @@ from concurrent.futures import ThreadPoolExecutor
 DB_PATH    = "/var/lib/vps-traffic/flows.db"
 XRAY_LOG   = "/var/log/xray/access.log"
 GEOIP_PATH = "/opt/vps-traffic-web/geoip/GeoLite2-Country.mmdb"
-FILTER_PORTS = {22, 53}          # 过滤 SSH 和 DNS 噪音
+FILTER_PORTS = {22, 53, WEB_PORT} # 过滤 SSH、DNS 和监控面板自身流量
 RDNS_WORKERS = 8                  # rDNS 有界线程池大小
 MATCH_WINDOW = 15                # Xray log 与 conntrack 匹配时间窗（秒，无 conntrack 时快速落库）
 BATCH_INTERVAL = 5               # 批量写库间隔（秒）
