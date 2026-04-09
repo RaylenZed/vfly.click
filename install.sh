@@ -866,6 +866,46 @@ BATCH_INTERVAL = 5               # 批量写库间隔（秒）
 RDNS_TTL   = 86400               # rDNS 缓存 TTL（秒）
 RDNS_RATE  = 10                  # rDNS 每秒最多查询次数
 
+# ---- 协议端口自动检测 ----
+def detect_proto_ports():
+    """从现有配置文件中读取各协议监听端口，返回 {port: 'protocol_name'} 映射"""
+    ports = {}
+    # Reality / VLESS (Xray)
+    try:
+        with open("/usr/local/etc/xray/config.json") as f:
+            cfg = json.load(f)
+            for inb in cfg.get("inbounds", []):
+                if inb.get("protocol") in ("vless", "vmess"):
+                    ports[inb["port"]] = "reality"
+    except Exception:
+        pass
+    # Hysteria2
+    try:
+        with open("/etc/hysteria/config.yaml") as f:
+            for line in f:
+                if line.strip().startswith("listen:"):
+                    # listen: :443  or  listen: 0.0.0.0:443
+                    part = line.split(":")[-1].strip()
+                    if part.isdigit():
+                        ports[int(part)] = "hysteria2"
+                    break
+    except Exception:
+        pass
+    # Snell
+    try:
+        with open("/etc/snell/snell-server.conf") as f:
+            for line in f:
+                if "=" in line and "port" in line.lower():
+                    val = line.split("=", 1)[1].strip()
+                    if val.isdigit():
+                        ports[int(val)] = "snell"
+    except Exception:
+        pass
+    return ports
+
+PROTO_PORTS = detect_proto_ports()
+log.info("协议端口映射: %s", PROTO_PORTS)
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("collector")
 
@@ -953,18 +993,25 @@ CREATE TABLE IF NOT EXISTS flows (
   bytes_up   INTEGER,
   bytes_down INTEGER,
   country    TEXT,
-  host       TEXT
+  host       TEXT,
+  protocol   TEXT
 );
-CREATE INDEX IF NOT EXISTS idx_flows_ts      ON flows(ts);
-CREATE INDEX IF NOT EXISTS idx_flows_country ON flows(country);
-CREATE INDEX IF NOT EXISTS idx_flows_dst_ip  ON flows(dst_ip);
-CREATE INDEX IF NOT EXISTS idx_flows_src_ip  ON flows(src_ip);
+CREATE INDEX IF NOT EXISTS idx_flows_ts       ON flows(ts);
+CREATE INDEX IF NOT EXISTS idx_flows_country  ON flows(country);
+CREATE INDEX IF NOT EXISTS idx_flows_dst_ip   ON flows(dst_ip);
+CREATE INDEX IF NOT EXISTS idx_flows_src_ip   ON flows(src_ip);
+CREATE INDEX IF NOT EXISTS idx_flows_protocol ON flows(protocol);
 CREATE TABLE IF NOT EXISTS rdns_cache (
   ip      TEXT PRIMARY KEY,
   host    TEXT,
   updated INTEGER
 );
 """)
+        # 迁移旧数据库：若缺少 protocol 列则添加
+        cols = [r[1] for r in conn.execute("PRAGMA table_info(flows)").fetchall()]
+        if "protocol" not in cols:
+            conn.execute("ALTER TABLE flows ADD COLUMN protocol TEXT")
+            log.info("数据库已迁移：flows 表新增 protocol 列")
 
 # ---- 批量写队列 ----
 _write_queue = []
@@ -985,8 +1032,8 @@ def flush_writer():
         try:
             with sqlite3.connect(DB_PATH, timeout=30) as conn:
                 conn.executemany(
-                    "INSERT INTO flows (ts,proto,direction,src_ip,src_port,dst_ip,dst_port,bytes_up,bytes_down,country,host) "
-                    "VALUES (?,?,?,?,?,?,?,?,?,?,?)", batch)
+                    "INSERT INTO flows (ts,proto,direction,src_ip,src_port,dst_ip,dst_port,bytes_up,bytes_down,country,host,protocol) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", batch)
         except Exception as e:
             log.error("DB write error: %s", e)
 
@@ -1028,7 +1075,7 @@ def xray_log_reader():
                 with _xray_lock:
                     _xray_pending[key] = [ts, "in", src_ip, src_port,
                                           dst_ip or "", dst_port,
-                                          country, host or dst_host, expire]
+                                          country, host or dst_host, expire, "reality"]
         except Exception as e:
             log.warning("xray_log_reader error: %s", e)
             time.sleep(5)
@@ -1045,8 +1092,8 @@ def xray_pending_reaper():
                     expired.append((key, val))
                     del _xray_pending[key]
         for key, val in expired:
-            ts, direction, src_ip, src_port, dst_ip, dst_port, country, host, _ = val
-            enqueue((ts, "tcp", direction, src_ip, src_port, dst_ip, dst_port, None, None, country, host))
+            ts, direction, src_ip, src_port, dst_ip, dst_port, country, host, _, protocol = val
+            enqueue((ts, "tcp", direction, src_ip, src_port, dst_ip, dst_port, None, None, country, host, protocol))
 
 # ---- conntrack 解析 ----
 # 格式(DESTROY): [时间戳] tcp src=1.2.3.4 dst=5.6.7.8 sport=54321 dport=443 ... bytes=1234 ...
@@ -1090,19 +1137,22 @@ def conntrack_reader():
                     if key in _xray_pending:
                         matched = _xray_pending.pop(key)
                 if matched:
-                    _, _, _, _, xdst_ip, _, country, host, _ = matched
+                    _, _, _, _, xdst_ip, _, country, host, _, protocol = matched
                     enqueue((ts, proto, direction, src_ip, src_port,
                              xdst_ip or dst_ip, dst_port,
-                             bytes_up, bytes_down, country, host))
+                             bytes_up, bytes_down, country, host, protocol))
                 else:
                     country = geoip(peer_ip)
+                    # 按 dst_port 判断协议（Hysteria2/Snell 等非 Xray 代理）
+                    protocol = PROTO_PORTS.get(dst_port if direction == "in" else src_port)
                     # 非 Xray 流量，提交到有界线程池做 rDNS（最多 RDNS_WORKERS 个并发）
                     def do_rdns(ts=ts, proto=proto, direction=direction,
                                 src_ip=src_ip, src_port=src_port, dst_ip=dst_ip, dst_port=dst_port,
-                                bytes_up=bytes_up, bytes_down=bytes_down, country=country, peer_ip=peer_ip):
+                                bytes_up=bytes_up, bytes_down=bytes_down, country=country,
+                                peer_ip=peer_ip, protocol=protocol):
                         host = rdns_lookup(peer_ip)
                         enqueue((ts, proto, direction, src_ip, src_port, dst_ip, dst_port,
-                                 bytes_up, bytes_down, country, host))
+                                 bytes_up, bytes_down, country, host, protocol))
                     _rdns_pool.submit(do_rdns)
         except Exception as e:
             log.warning("conntrack_reader error: %s", e)
@@ -1157,7 +1207,7 @@ EOF
 
     # Phase B: 不插值（单引号 heredoc，JS 模板字符串安全）
     cat >> "$TRAFFIC_WEB_DIR/server.py" <<'PYEOF'
-import http.server, json, subprocess, os, urllib.parse, hmac, sqlite3
+import http.server, json, subprocess, os, urllib.parse, hmac, sqlite3, re
 
 import secrets
 
@@ -1218,16 +1268,22 @@ def db_conn():
     except Exception:
         return None
 
-def flows_summary(range_key="7d", direction=None):
+def _safe_clause(val, col):
+    """生成 AND col='val' 子句，仅允许字母数字"""
+    if val and re.match(r'^[a-zA-Z0-9_-]+$', val):
+        return f"AND {col}='{val}'"
+    return ""
+
+def flows_summary(range_key="7d", direction=None, protocol=None):
     since_expr = RANGE_MAP.get(range_key, RANGE_MAP["7d"])
     conn = db_conn()
     if not conn:
         return {"connections": 0, "bytes_up": 0, "bytes_down": 0}
-    dir_clause = f"AND direction='{direction}'" if direction else ""
+    extra = _safe_clause(direction, "direction") + _safe_clause(protocol, "protocol")
     try:
         row = conn.execute(
             f"SELECT COUNT(*) as c, COALESCE(SUM(bytes_up),0) as bu, COALESCE(SUM(bytes_down),0) as bd "
-            f"FROM flows WHERE ts >= {since_expr} {dir_clause}"
+            f"FROM flows WHERE ts >= {since_expr} {extra}"
         ).fetchone()
         return {"connections": row["c"], "bytes_up": row["bu"], "bytes_down": row["bd"]}
     except Exception:
@@ -1235,21 +1291,21 @@ def flows_summary(range_key="7d", direction=None):
     finally:
         conn.close()
 
-def flows_top(field="host", range_key="7d", direction=None, limit=30):
+def flows_top(field="host", range_key="7d", direction=None, limit=30, protocol=None):
     since_expr = RANGE_MAP.get(range_key, RANGE_MAP["7d"])
     conn = db_conn()
     if not conn:
         return []
     # 安全白名单
     allowed = {"host": "COALESCE(host, dst_ip)", "dst_ip": "dst_ip",
-               "src_ip": "src_ip", "country": "country"}
+               "src_ip": "src_ip", "country": "country", "protocol": "protocol"}
     expr = allowed.get(field, "COALESCE(host, dst_ip)")
-    dir_clause = f"AND direction='{direction}'" if direction else ""
+    extra = _safe_clause(direction, "direction") + _safe_clause(protocol, "protocol")
     try:
         rows = conn.execute(
             f"SELECT {expr} as label, COUNT(*) as cnt, "
             f"COALESCE(SUM(bytes_up),0)+COALESCE(SUM(bytes_down),0) as total_bytes "
-            f"FROM flows WHERE ts >= {since_expr} AND {expr} IS NOT NULL {dir_clause} "
+            f"FROM flows WHERE ts >= {since_expr} AND {expr} IS NOT NULL {extra} "
             f"GROUP BY label ORDER BY total_bytes DESC LIMIT ?", (limit,)
         ).fetchall()
         return [{"label": r["label"], "cnt": r["cnt"], "bytes": r["total_bytes"]} for r in rows]
@@ -1258,18 +1314,18 @@ def flows_top(field="host", range_key="7d", direction=None, limit=30):
     finally:
         conn.close()
 
-def flows_timeline(range_key="7d", bucket="day", direction=None):
+def flows_timeline(range_key="7d", bucket="day", direction=None, protocol=None):
     since_expr = RANGE_MAP.get(range_key, RANGE_MAP["7d"])
     conn = db_conn()
     if not conn:
         return []
-    fmt = "%Y-%m-%d" if bucket == "day" else "%Y-%m-%d %H:00"
-    dir_clause = f"AND direction='{direction}'" if direction else ""
+    tfmt = "%Y-%m-%d" if bucket == "day" else "%Y-%m-%d %H:00"
+    extra = _safe_clause(direction, "direction") + _safe_clause(protocol, "protocol")
     try:
         rows = conn.execute(
-            f"SELECT strftime('{fmt}', ts, 'unixepoch', 'localtime') as t, "
+            f"SELECT strftime('{tfmt}', ts, 'unixepoch', 'localtime') as t, "
             f"COALESCE(SUM(bytes_up),0)+COALESCE(SUM(bytes_down),0) as bytes, COUNT(*) as cnt "
-            f"FROM flows WHERE ts >= {since_expr} {dir_clause} "
+            f"FROM flows WHERE ts >= {since_expr} {extra} "
             f"GROUP BY t ORDER BY t"
         ).fetchall()
         return [{"t": r["t"], "bytes": r["bytes"], "cnt": r["cnt"]} for r in rows]
@@ -1285,9 +1341,29 @@ def flows_recent(limit=100):
     try:
         rows = conn.execute(
             "SELECT ts, proto, direction, src_ip, src_port, dst_ip, dst_port, "
-            "bytes_up, bytes_down, country, host FROM flows ORDER BY ts DESC LIMIT ?", (limit,)
+            "bytes_up, bytes_down, country, host, protocol FROM flows ORDER BY ts DESC LIMIT ?", (limit,)
         ).fetchall()
         return [dict(r) for r in rows]
+    except Exception:
+        return []
+    finally:
+        conn.close()
+
+def flows_by_protocol(range_key="7d"):
+    """返回各协议的流量统计 {protocol: {connections, bytes_up, bytes_down}}"""
+    since_expr = RANGE_MAP.get(range_key, RANGE_MAP["7d"])
+    conn = db_conn()
+    if not conn:
+        return []
+    try:
+        rows = conn.execute(
+            f"SELECT COALESCE(protocol,'其他') as p, COUNT(*) as c, "
+            f"COALESCE(SUM(bytes_up),0) as bu, COALESCE(SUM(bytes_down),0) as bd "
+            f"FROM flows WHERE ts >= {since_expr} "
+            f"GROUP BY p ORDER BY bu+bd DESC"
+        ).fetchall()
+        return [{"protocol": r["p"], "connections": r["c"],
+                 "bytes_up": r["bu"], "bytes_down": r["bd"]} for r in rows]
     except Exception:
         return []
     finally:
@@ -1413,6 +1489,11 @@ tr:hover td{background:var(--surface2)}
         <button class="range-btn" onclick="setRange('out','7d',this)">7天</button>
         <button class="range-btn" onclick="setRange('out','30d',this)">30天</button>
         <button class="range-btn" onclick="setRange('out','6m',this)">6个月</button>
+        <span class="range-label" style="margin-left:10px">协议:</span>
+        <button class="range-btn active" onclick="setProto('out',null,this)">全部</button>
+        <button class="range-btn" onclick="setProto('out','reality',this)">Reality</button>
+        <button class="range-btn" onclick="setProto('out','hysteria2',this)">Hysteria2</button>
+        <button class="range-btn" onclick="setProto('out','snell',this)">Snell</button>
       </div>
       <div id="outbound-content"><div class="loading">加载中...</div></div>
     </div>
@@ -1423,6 +1504,11 @@ tr:hover td{background:var(--surface2)}
         <button class="range-btn" onclick="setRange('in','7d',this)">7天</button>
         <button class="range-btn" onclick="setRange('in','30d',this)">30天</button>
         <button class="range-btn" onclick="setRange('in','6m',this)">6个月</button>
+        <span class="range-label" style="margin-left:10px">协议:</span>
+        <button class="range-btn active" onclick="setProto('in',null,this)">全部</button>
+        <button class="range-btn" onclick="setProto('in','reality',this)">Reality</button>
+        <button class="range-btn" onclick="setProto('in','hysteria2',this)">Hysteria2</button>
+        <button class="range-btn" onclick="setProto('in','snell',this)">Snell</button>
       </div>
       <div id="inbound-content"><div class="loading">加载中...</div></div>
     </div>
@@ -1478,7 +1564,14 @@ const fmt=b=>{
   return b+" B";
 };
 const TAB_TITLES={overview:"总览",outbound:"出站详情",inbound:"入站详情",live:"实时流水"};
-let activeTab="overview",ranges={out:"today",in:"today"},charts={};
+let activeTab="overview",ranges={out:"today",in:"today"},protos={out:null,in:null},charts={};
+function setProto(dir,p,el){
+  el.closest(".range-bar").querySelectorAll(".range-btn").forEach(b=>{
+    if(["全部","Reality","Hysteria2","Snell"].includes(b.textContent))b.classList.remove("active");
+  });
+  el.classList.add("active"); protos[dir]=p;
+  loadTab(dir==="out"?"outbound":"inbound");
+}
 function switchTab(name,el){
   document.querySelectorAll(".nav-item").forEach(t=>t.classList.remove("active"));
   document.querySelectorAll(".panel").forEach(p=>p.classList.remove("active"));
@@ -1505,14 +1598,21 @@ async function loadTab(name){
 const isDark=()=>!document.documentElement.classList.contains("light");
 const tickColor=()=>isDark()?"#64748b":"#94a3b8";
 const legColor=()=>isDark()?"#94a3b8":"#475569";
+const PROTO_COLORS={"reality":"rgba(99,102,241,.8)","hysteria2":"rgba(34,197,94,.8)","snell":"rgba(251,191,36,.8)","其他":"rgba(100,116,139,.6)"};
+const PROTO_ICON={"reality":"⚡","hysteria2":"🌊","snell":"🐌","其他":"?"};
 async function loadOverview(){
-  const d=await api("/api");
+  const [d, proto7d] = await Promise.all([api("/api"), api("/api/flows/by_protocol?range=7d")]);
   const el=document.getElementById("panel-overview");
   if(!d){el.innerHTML="<div class='loading' style='color:#ef4444'>数据加载失败</div>";return;}
   const {rx,tx,quota_gb,alert_pct,used_pct,remain,days,months,iface}=d;
   const total=rx+tx,barCls=used_pct>=90?"red":used_pct>=alert_pct?"yellow":"green";
   const badgeCls=used_pct>=90?"crit":used_pct>=alert_pct?"warn":"ok";
   const badgeTxt=used_pct>=90?"⚠ 严重":used_pct>=alert_pct?"⚠ 告警":"✓ 正常";
+  const protoRows=(proto7d||[]).map(r=>`<tr>
+    <td><span style="font-size:.85rem">${PROTO_ICON[r.protocol]||"?"}</span> ${r.protocol}</td>
+    <td>${r.connections.toLocaleString()}</td>
+    <td>${fmt(r.bytes_up+r.bytes_down)}</td>
+  </tr>`).join("")||`<tr><td colspan="3" style="text-align:center;color:var(--text-muted);padding:12px">暂无采集数据</td></tr>`;
   el.innerHTML=`
   <div class="grid">
     <div class="card"><h3>本月合计 <span class="badge ${badgeCls}">${badgeTxt}</span></h3>
@@ -1530,9 +1630,28 @@ async function loadOverview(){
       <div class="sub">↑ ${days.length?fmt(days[days.length-1].tx):"--"} &nbsp; ↓ ${days.length?fmt(days[days.length-1].rx):"--"}</div>
     </div>
   </div>
+  <div class="two-col">
+    <div class="chart-card"><h3>协议分布 (近7天)</h3>
+      <canvas id="protoChart" height="120"></canvas>
+    </div>
+    <div class="chart-card"><h3>协议流量明细 (近7天)</h3>
+      <table><thead><tr><th>协议</th><th>连接数</th><th>总流量</th></tr></thead>
+      <tbody>${protoRows}</tbody></table>
+    </div>
+  </div>
   <div class="chart-card"><h3>近 30 天日流量</h3><canvas id="dayChart" height="70"></canvas></div>
   <div class="chart-card"><h3>月度流量历史</h3><canvas id="monChart" height="70"></canvas></div>`;
-  if(charts.day)charts.day.destroy(); if(charts.mon)charts.mon.destroy();
+  if(charts.day)charts.day.destroy(); if(charts.mon)charts.mon.destroy(); if(charts.proto)charts.proto.destroy();
+  // 协议饼图
+  const pd=proto7d||[];
+  if(pd.length){
+    charts.proto=new Chart(document.getElementById("protoChart"),{type:"doughnut",data:{
+      labels:pd.map(r=>r.protocol),
+      datasets:[{data:pd.map(r=>r.bytes_up+r.bytes_down),
+        backgroundColor:pd.map(r=>PROTO_COLORS[r.protocol]||"rgba(100,116,139,.6)"),
+        borderWidth:1,borderColor:"var(--border)"}]
+    },options:{plugins:{legend:{position:"right",labels:{color:legColor(),boxWidth:12,padding:10}}},cutout:"60%"}});
+  }
   charts.day=new Chart(document.getElementById("dayChart"),{type:"bar",data:{labels:days.map(d=>d.date.slice(5)),datasets:[
     {label:"上传",data:days.map(d=>+(d.tx/1073741824).toFixed(3)),backgroundColor:"rgba(99,102,241,.7)",borderRadius:3},
     {label:"下载",data:days.map(d=>+(d.rx/1073741824).toFixed(3)),backgroundColor:"rgba(34,197,94,.7)",borderRadius:3}
@@ -1543,13 +1662,14 @@ async function loadOverview(){
   ]},options:{plugins:{legend:{labels:{color:legColor()}}},scales:{x:{ticks:{color:tickColor()}},y:{ticks:{color:tickColor(),callback:v=>v+"GB"}}}}});
 }
 async function loadDirectional(dir){
-  const range=ranges[dir],id=dir==="out"?"outbound-content":"inbound-content";
+  const range=ranges[dir],proto=protos[dir],id=dir==="out"?"outbound-content":"inbound-content";
+  const pq=proto?`&protocol=${proto}`:"";
   const [summary,topHost,topCountry,topIp,timeline]=await Promise.all([
-    api(`/api/flows/summary?range=${range}&direction=${dir}`),
-    api(`/api/flows/top?field=host&range=${range}&direction=${dir}&limit=30`),
-    api(`/api/flows/top?field=country&range=${range}&direction=${dir}&limit=15`),
-    api(`/api/flows/top?field=${dir==="out"?"dst_ip":"src_ip"}&range=${range}&direction=${dir}&limit=20`),
-    api(`/api/flows/timeline?range=${range}&direction=${dir}`),
+    api(`/api/flows/summary?range=${range}&direction=${dir}${pq}`),
+    api(`/api/flows/top?field=host&range=${range}&direction=${dir}&limit=30${pq}`),
+    api(`/api/flows/top?field=country&range=${range}&direction=${dir}&limit=15${pq}`),
+    api(`/api/flows/top?field=${dir==="out"?"dst_ip":"src_ip"}&range=${range}&direction=${dir}&limit=20${pq}`),
+    api(`/api/flows/timeline?range=${range}&direction=${dir}${pq}`),
   ]);
   const s=summary||{connections:0,bytes_up:0,bytes_down:0};
   const totalBytes=s.bytes_up+s.bytes_down,maxBytes=(topHost&&topHost.length)?topHost[0].bytes:1;
@@ -1593,13 +1713,14 @@ async function loadLive(){
     const ts=new Date(r.ts*1000).toLocaleTimeString("zh-CN");
     const dirLabel=r.direction==="in"?`<span class="dir-in">↓ 入站</span>`:`<span class="dir-out">↑ 出站</span>`;
     const host=r.host||r.dst_ip||"—";
-    return `<tr><td>${ts}</td><td>${dirLabel}</td><td>${r.src_ip||"—"}</td><td>${host}${r.dst_port?":"+r.dst_port:""}</td><td>${r.country||"—"}</td><td>${fmt((r.bytes_up||0)+(r.bytes_down||0))}</td></tr>`;
+    const pLabel=r.protocol?`<span style="font-size:.7rem;padding:1px 6px;border-radius:4px;background:var(--surface2);color:var(--text-sub)">${r.protocol}</span>`:"—";
+    return `<tr><td>${ts}</td><td>${dirLabel}</td><td>${pLabel}</td><td>${r.src_ip||"—"}</td><td>${host}${r.dst_port?":"+r.dst_port:""}</td><td>${r.country||"—"}</td><td>${fmt((r.bytes_up||0)+(r.bytes_down||0))}</td></tr>`;
   }).join("");
   document.getElementById("live-content").innerHTML=`
   <div class="chart-card"><h3>最近 100 条连接 <span style="font-weight:400;font-size:.72rem;color:var(--text-muted)">(每30秒刷新)</span></h3>
     <div style="overflow-x:auto">
-    <table><thead><tr><th>时间</th><th>方向</th><th>来源 IP</th><th>目标 域名/IP</th><th>国家</th><th>流量</th></tr></thead>
-    <tbody>${tbody||`<tr><td colspan="6" style="text-align:center;color:var(--text-muted);padding:20px">暂无数据，采集器正在收集中...</td></tr>`}</tbody>
+    <table><thead><tr><th>时间</th><th>方向</th><th>协议</th><th>来源 IP</th><th>目标 域名/IP</th><th>国家</th><th>流量</th></tr></thead>
+    <tbody>${tbody||`<tr><td colspan="7" style="text-align:center;color:var(--text-muted);padding:20px">暂无数据，采集器正在收集中...</td></tr>`}</tbody>
     </table></div>
   </div>`;
 }
@@ -1656,13 +1777,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if path == "/api":
             self._api_vnstat()
         elif path == "/api/flows/summary":
-            self._api_json(flows_summary(qs.get("range",["7d"])[0], qs.get("direction",[None])[0]))
+            self._api_json(flows_summary(qs.get("range",["7d"])[0], qs.get("direction",[None])[0], qs.get("protocol",[None])[0]))
         elif path == "/api/flows/top":
-            self._api_json(flows_top(qs.get("field",["host"])[0], qs.get("range",["7d"])[0], qs.get("direction",[None])[0], int(qs.get("limit",["30"])[0])))
+            self._api_json(flows_top(qs.get("field",["host"])[0], qs.get("range",["7d"])[0], qs.get("direction",[None])[0], int(qs.get("limit",["30"])[0]), qs.get("protocol",[None])[0]))
         elif path == "/api/flows/timeline":
-            self._api_json(flows_timeline(qs.get("range",["7d"])[0], qs.get("bucket",["day"])[0], qs.get("direction",[None])[0]))
+            self._api_json(flows_timeline(qs.get("range",["7d"])[0], qs.get("bucket",["day"])[0], qs.get("direction",[None])[0], qs.get("protocol",[None])[0]))
         elif path == "/api/flows/recent":
             self._api_json(flows_recent(int(qs.get("limit",["100"])[0])))
+        elif path == "/api/flows/by_protocol":
+            self._api_json(flows_by_protocol(qs.get("range",["7d"])[0]))
         else:
             self._index()
 
