@@ -100,7 +100,8 @@ check_status() {
 
 install_reality() {
     echo -e "${BLUE}>>> 安装/重置 Xray Reality...${NC}"
-    if ! bash -c "$(curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install; then
+    bash -c "$(curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install
+    if ! command -v xray &>/dev/null && [[ ! -f /usr/local/bin/xray ]]; then
         echo -e "${RED}Xray 安装失败，请检查网络或稍后重试。${NC}"
         return 1
     fi
