@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # =========================================================
-# VFly - Multi-Protocol Manager V3.9
+# VFly - Multi-Protocol Manager V3.10
 # =========================================================
 
 # --- 颜色定义 ---
@@ -1122,7 +1122,7 @@ def xray_pending_reaper():
 # 每 POLL_INTERVAL 秒读取 /proc/net/nf_conntrack，对消失的连接触发记录
 # nf_conntrack_acct=1 时每行有两组 bytes= 字段（orig/reply 方向）
 CT_FILE = "/proc/net/nf_conntrack"
-POLL_INTERVAL = 5   # 秒，越小越实时但 CPU 略高
+POLL_INTERVAL = 3   # 秒，越小越实时但 CPU 略高
 _ct_src_re  = re.compile(r"src=([\d.]+)\s+dst=([\d.]+)\s+sport=(\d+)\s+dport=(\d+)")
 _ct_bytes_re = re.compile(r"bytes=(\d+)")
 _ct_proto_re = re.compile(r"^\S+\s+\d+\s+(\w+)")
@@ -1164,7 +1164,8 @@ def _handle_gone_conn(proto, src_ip, dst_ip, sport, dport, bytes_orig, bytes_rep
                  xdst_ip or dst_ip, dport, bytes_up, bytes_down, country, host, protocol))
     else:
         country  = geoip(peer_ip)
-        protocol = PROTO_PORTS.get(dport if direction == "in" else sport)
+        # 出站连接 sport 是本机随机端口，无法靠端口猜协议，留 None
+        protocol = PROTO_PORTS.get(dport) if direction == "in" else None
         def do_rdns(ts=first_ts, proto=proto, direction=direction,
                     src_ip=src_ip, sport=sport, dst_ip=dst_ip, dport=dport,
                     bytes_up=bytes_up, bytes_down=bytes_down,
@@ -1173,6 +1174,50 @@ def _handle_gone_conn(proto, src_ip, dst_ip, sport, dport, bytes_orig, bytes_rep
             enqueue((ts, proto, direction, src_ip, sport, dst_ip, dport,
                      bytes_up, bytes_down, country, host, protocol))
         _rdns_pool.submit(do_rdns)
+
+# ---- Hysteria2 日志解析（获取目标域名 + 标注协议）----
+# Hysteria2 server 日志格式（journald）：
+#   client 1.2.3.4:12345: TCP request: www.youtube.com:443
+#   client 1.2.3.4:12345: UDP request: 8.8.8.8:53 (may also be "tunnel")
+_hy2_re = re.compile(
+    r"client\s+([\d.a-fA-F:]+):(\d+).*?(?:TCP|UDP)\s+(?:request|tunnel)[:\s]+([^\s:]+):(\d+)"
+)
+
+def hy2_log_reader():
+    """从 journald 流式读取 Hysteria2 server 日志，提取目标域名写入 pending"""
+    while True:
+        try:
+            proc = subprocess.Popen(
+                ["journalctl", "-u", "hysteria-server", "-f", "-n", "0", "--output", "cat"],
+                stdout=subprocess.PIPE, text=True)
+            for line in proc.stdout:
+                m = _hy2_re.search(line)
+                if not m:
+                    continue
+                src_ip, src_port_s, dst_host, dst_port_s = m.groups()
+                src_port = int(src_port_s)
+                dst_port = int(dst_port_s)
+                if dst_port in FILTER_PORTS:
+                    continue
+                ts = int(time.time())
+                country = geoip(src_ip)
+                # dst_host 为纯 IP 时不当 host
+                is_ip = dst_host.replace(".", "").replace(":", "").isdigit()
+                host   = None if is_ip else dst_host
+                dst_ip = dst_host if is_ip else None
+                key = (src_ip, src_port, dst_port)
+                expire = time.time() + MATCH_WINDOW
+                with _xray_lock:
+                    _xray_pending[key] = [ts, "in", src_ip, src_port,
+                                          dst_ip or "", dst_port,
+                                          country, host or dst_host, expire, "hysteria2"]
+        except FileNotFoundError:
+            # journalctl 不存在或 hysteria-server unit 不存在，静默退出
+            log.info("hy2_log_reader: journalctl 不可用或 hysteria-server 未安装，跳过")
+            return
+        except Exception as e:
+            log.warning("hy2_log_reader error: %s", e)
+            time.sleep(5)
 
 def conntrack_poller():
     """主采集循环：轮询 /proc/net/nf_conntrack，连接消失即记录"""
@@ -1217,6 +1262,7 @@ if __name__ == "__main__":
     log.info("VPS 流量采集器启动 (DB: %s)", DB_PATH)
     threading.Thread(target=flush_writer,         daemon=True).start()
     threading.Thread(target=xray_log_reader,      daemon=True).start()
+    threading.Thread(target=hy2_log_reader,       daemon=True).start()
     threading.Thread(target=xray_pending_reaper,  daemon=True).start()
     threading.Thread(target=conntrack_poller,     daemon=True).start()
     # 主线程保活
@@ -1915,7 +1961,7 @@ traffic_web_install() {
         echo -e "${RED}无法检测网络接口${NC}"; return
     fi
 
-    echo -e "\n${YELLOW}=== 安装 Web 流量面板 (V3.9) ===${NC}"
+    echo -e "\n${YELLOW}=== 安装 Web 流量面板 (V3.10) ===${NC}"
     echo -e "接口: ${CYAN}${iface}${NC}  配额: ${QUOTA_GB}GB  重置日: ${RESET_DAY}日"
     echo ""
 
@@ -2094,7 +2140,7 @@ manage_traffic_web_menu() {
 main_menu() {
     while true; do
         echo -e "\n${BLUE}=====================================${NC}"
-        echo -e "   全能协议管理脚本 V3.9"
+        echo -e "   全能协议管理脚本 V3.10"
         echo -e "${BLUE}=====================================${NC}"
         echo -e "1. 安装/重置 Reality (TCP 443)  [$(check_status xray)]"
         echo -e "2. 安装/重置 Hysteria2 (UDP 443)[$(check_status hysteria-server)]"
