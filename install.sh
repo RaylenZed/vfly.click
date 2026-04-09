@@ -1235,11 +1235,11 @@ def ss_poller():
             current = set()
             for line in out.splitlines():
                 parts = line.split()
-                if len(parts) < 5:
+                if len(parts) < 4:
                     continue
-                # Format: ESTAB RecvQ SendQ LocalAddr:Port PeerAddr:Port [...]
-                local = parts[3]
-                peer  = parts[4]
+                # ss -tnH state established: RecvQ SendQ Local:Port Peer:Port
+                local = parts[2]
+                peer  = parts[3]
                 try:
                     lcolon = local.rfind(":")
                     pcolon = peer.rfind(":")
