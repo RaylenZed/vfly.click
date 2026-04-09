@@ -72,14 +72,14 @@ check_root() {
 }
 
 install_tools() {
-    if ! command -v jq &>/dev/null || ! command -v qrencode &>/dev/null; then
+    if ! command -v jq &>/dev/null || ! command -v qrencode &>/dev/null || ! command -v python3 &>/dev/null; then
         echo -e "${BLUE}正在安装必要工具...${NC}"
         if command -v apt &>/dev/null; then
-            apt update -y && apt install -y wget curl unzip vim jq qrencode openssl socat
+            apt update -y && apt install -y wget curl unzip vim jq qrencode openssl socat python3 python3-pip
         elif command -v yum &>/dev/null; then
-            yum update -y && yum install -y wget curl unzip vim jq qrencode openssl socat
+            yum update -y && yum install -y wget curl unzip vim jq qrencode openssl socat python3 python3-pip
         elif command -v dnf &>/dev/null; then
-            dnf update -y && dnf install -y wget curl unzip vim jq qrencode openssl socat
+            dnf update -y && dnf install -y wget curl unzip vim jq qrencode openssl socat python3 python3-pip
         fi
     fi
 }
@@ -220,8 +220,10 @@ install_reality() {
   }
 }
 EOF
+    chmod 600 "$XRAY_CONF"
     # 保存公钥到文件以便后续查看
     echo "$PUB" > /usr/local/etc/xray/public.key
+    chmod 600 /usr/local/etc/xray/public.key
 
     if ! systemctl restart xray; then
         echo -e "${RED}Xray 服务启动失败，请查看日志: journalctl -u xray -n 20${NC}"
@@ -297,7 +299,7 @@ install_hy2() {
 
     mkdir -p /etc/hysteria
     openssl req -x509 -nodes -newkey rsa:2048 -keyout /etc/hysteria/server.key -out /etc/hysteria/server.crt -days 3650 -subj "/CN=bing.com" 2>/dev/null
-    PASS=$(openssl rand -base64 16)
+    PASS=$(openssl rand -hex 16)
 
     cat > $HY2_CONF <<EOF
 listen: :$SELECTED_PORT
@@ -404,6 +406,7 @@ listen = 0.0.0.0:11807
 psk = $PSK
 ipv6 = false
 EOF
+    chmod 600 "$SNELL_CONF"
 
     GROUP="nobody"
     grep -q "nogroup" /etc/group && GROUP="nogroup"
@@ -499,6 +502,7 @@ ALERT_PCT=${ALERT_PCT}
 WEB_TOKEN=${WEB_TOKEN:-}
 WEB_PORT=${WEB_PORT:-}
 EOF
+    chmod 600 "$TRAFFIC_CONF"
 }
 
 _traffic_setup_logrotate() {
@@ -594,7 +598,14 @@ _traffic_flows_cleanup_cron() {
 #!/bin/bash
 DB="/var/lib/vps-traffic/flows.db"
 [[ -f "$DB" ]] || exit 0
-sqlite3 "$DB" "DELETE FROM flows WHERE ts < strftime('%s','now','-6 months'); VACUUM;" 2>/dev/null
+python3 - "$DB" <<'EOF'
+import sys, sqlite3, time
+db = sys.argv[1]
+cutoff = int(time.time()) - 180 * 86400  # 6 个月
+with sqlite3.connect(db) as conn:
+    conn.execute("DELETE FROM flows WHERE ts < ?", (cutoff,))
+    conn.execute("VACUUM")
+EOF
 logger -t vps-flows "cleanup: removed flows older than 6 months"
 SCRIPT
     chmod +x "$cron_script"
@@ -1744,14 +1755,27 @@ traffic_web_install() {
     echo ""
 
     local token
-    read -p "访问密码 (回车自动生成): " token
-    if [[ -z "$token" ]]; then
-        token=$(openssl rand -hex 8)
-        echo -e "${YELLOW}自动生成密码: ${CYAN}${token}${NC}"
-    fi
+    while true; do
+        read -p "访问密码 (仅限字母数字，回车自动生成): " token
+        if [[ -z "$token" ]]; then
+            token=$(openssl rand -hex 8)
+            echo -e "${YELLOW}自动生成密码: ${CYAN}${token}${NC}"
+            break
+        elif [[ "$token" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+            break
+        else
+            echo -e "${RED}密码只允许字母、数字、下划线、连字符，请重新输入${NC}"
+        fi
+    done
 
     read -p "Web 端口 [默认: ${TRAFFIC_WEB_PORT}]: " input_port
-    [[ -n "$input_port" ]] && TRAFFIC_WEB_PORT="$input_port"
+    if [[ -n "$input_port" ]]; then
+        if [[ "$input_port" =~ ^[0-9]+$ ]] && (( input_port >= 1 && input_port <= 65535 )); then
+            TRAFFIC_WEB_PORT="$input_port"
+        else
+            echo -e "${YELLOW}无效端口，使用默认 ${TRAFFIC_WEB_PORT}${NC}"
+        fi
+    fi
 
     # 安装依赖
     echo -e "${BLUE}>>> 安装 conntrack...${NC}"
