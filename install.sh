@@ -485,6 +485,8 @@ _traffic_load_conf() {
     ALERT_PCT=80
     WEB_TOKEN=""
     WEB_PORT=""
+    OFFSET_RX=0
+    OFFSET_TX=0
     if [[ -f "$TRAFFIC_CONF" ]]; then
         local _val
         _val=$(grep -m1 '^QUOTA_GB=' "$TRAFFIC_CONF" | cut -d'=' -f2-)
@@ -497,6 +499,10 @@ _traffic_load_conf() {
         [[ -n "$_val" ]] && WEB_TOKEN="$_val"
         _val=$(grep -m1 '^WEB_PORT=' "$TRAFFIC_CONF" | cut -d'=' -f2-)
         [[ "$_val" =~ ^[0-9]+$ ]] && WEB_PORT="$_val"
+        _val=$(grep -m1 '^OFFSET_RX=' "$TRAFFIC_CONF" | cut -d'=' -f2-)
+        [[ "$_val" =~ ^[0-9]+$ ]] && OFFSET_RX="$_val"
+        _val=$(grep -m1 '^OFFSET_TX=' "$TRAFFIC_CONF" | cut -d'=' -f2-)
+        [[ "$_val" =~ ^[0-9]+$ ]] && OFFSET_TX="$_val"
     fi
 }
 
@@ -507,6 +513,8 @@ RESET_DAY=${RESET_DAY}
 ALERT_PCT=${ALERT_PCT}
 WEB_TOKEN=${WEB_TOKEN:-}
 WEB_PORT=${WEB_PORT:-}
+OFFSET_RX=${OFFSET_RX:-0}
+OFFSET_TX=${OFFSET_TX:-0}
 EOF
     chmod 600 "$TRAFFIC_CONF"
 }
@@ -903,11 +911,11 @@ def detect_proto_ports():
         pass
     return ports
 
-PROTO_PORTS = detect_proto_ports()
-log.info("协议端口映射: %s", PROTO_PORTS)
-
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("collector")
+
+PROTO_PORTS = detect_proto_ports()
+log.info("协议端口映射: %s", PROTO_PORTS)
 
 # ---- GeoIP ----
 try:
@@ -1192,6 +1200,7 @@ EOF
 
 _web_write_server() {
     local iface="$1" quota_gb="$2" reset_day="$3" alert_pct="$4" token="$5"
+    local offset_rx="${OFFSET_RX:-0}" offset_tx="${OFFSET_TX:-0}"
     mkdir -p "$TRAFFIC_WEB_DIR"
 
     # Phase A: bash 变量插值（仅写入配置常量，不含 JS 模板字符串）
@@ -1203,6 +1212,9 @@ RESET_DAY = ${reset_day}
 ALERT_PCT = ${alert_pct}
 TOKEN     = "${token}"
 PORT      = ${TRAFFIC_WEB_PORT}
+# 本月已消耗基准（字节），叠加到 vnstat 读数之上
+OFFSET_RX = ${offset_rx}
+OFFSET_TX = ${offset_tx}
 EOF
 
     # Phase B: 不插值（单引号 heredoc，JS 模板字符串安全）
@@ -1604,7 +1616,7 @@ async function loadOverview(){
   const [d, proto7d] = await Promise.all([api("/api"), api("/api/flows/by_protocol?range=7d")]);
   const el=document.getElementById("panel-overview");
   if(!d){el.innerHTML="<div class='loading' style='color:#ef4444'>数据加载失败</div>";return;}
-  const {rx,tx,quota_gb,alert_pct,used_pct,remain,days,months,iface}=d;
+  const {rx,tx,quota_gb,alert_pct,used_pct,remain,days,months,iface,offset_rx,offset_tx}=d;
   const total=rx+tx,barCls=used_pct>=90?"red":used_pct>=alert_pct?"yellow":"green";
   const badgeCls=used_pct>=90?"crit":used_pct>=alert_pct?"warn":"ok";
   const badgeTxt=used_pct>=90?"⚠ 严重":used_pct>=alert_pct?"⚠ 告警":"✓ 正常";
@@ -1620,6 +1632,7 @@ async function loadOverview(){
       <div class="bar-wrap"><div class="bar ${barCls}" style="width:${Math.min(used_pct,100)}%"></div></div>
       <div class="stat-row"><span>已用 ${used_pct}%</span><span class="stat-val">剩余 ${fmt(remain)}</span></div>
       <div class="stat-row"><span>配额</span><span class="stat-val">${quota_gb} GB</span></div>
+      ${(offset_rx||offset_tx)?`<div class="stat-row" style="margin-top:6px;font-size:.72rem;color:var(--text-muted)"><span>含手动偏移</span><span>↓${fmt(offset_rx||0)} ↑${fmt(offset_tx||0)}</span></div>`:""}
     </div>
     <div class="card"><h3>上传 / 下载</h3>
       <div class="big">${fmt(tx)}</div><div class="sub">↑ 上传</div>
@@ -1803,6 +1816,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def _api_vnstat(self):
         rx, tx = get_month_data()
+        rx += OFFSET_RX
+        tx += OFFSET_TX
         total = rx + tx
         quota_bytes = QUOTA_GB * 1024**3
         used_pct = int(total * 100 / quota_bytes) if quota_bytes else 0
@@ -1811,6 +1826,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             "iface": IFACE, "rx": rx, "tx": tx,
             "quota_gb": QUOTA_GB, "alert_pct": ALERT_PCT,
             "used_pct": used_pct, "remain": remain,
+            "offset_rx": OFFSET_RX, "offset_tx": OFFSET_TX,
             "days": get_day_data(30),
             "months": get_all_months(),
         })
@@ -1962,6 +1978,40 @@ traffic_web_remove() {
     echo -e "${GREEN}Web 面板及采集器已卸载。${NC}"
 }
 
+traffic_web_set_offset() {
+    _traffic_load_conf
+    local iface
+    iface=$(_traffic_get_iface)
+    echo -e "\n${YELLOW}=== 设置本月已消耗流量偏移 ===${NC}"
+    echo -e "当前偏移: 下行 ${CYAN}$(awk "BEGIN{printf \"%.2f GB\", ${OFFSET_RX:-0}/1073741824}")${NC}  上行 ${CYAN}$(awk "BEGIN{printf \"%.2f GB\", ${OFFSET_TX:-0}/1073741824}")${NC}"
+    echo -e "${YELLOW}提示: 填入面板统计周期开始前已消耗的流量（如账单显示已用 280 GB，则填 280）${NC}"
+    echo -e "      留空 = 保持原值，填 0 = 清零"
+    read -p "本月已消耗下行 (GB，留空不变): " inp_rx
+    read -p "本月已消耗上行 (GB，留空不变): " inp_tx
+    if [[ -n "$inp_rx" ]]; then
+        if [[ "$inp_rx" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+            OFFSET_RX=$(awk "BEGIN{printf \"%d\", ${inp_rx}*1073741824}")
+        else
+            echo -e "${RED}无效数字，下行偏移未修改${NC}"
+        fi
+    fi
+    if [[ -n "$inp_tx" ]]; then
+        if [[ "$inp_tx" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+            OFFSET_TX=$(awk "BEGIN{printf \"%d\", ${inp_tx}*1073741824}")
+        else
+            echo -e "${RED}无效数字，上行偏移未修改${NC}"
+        fi
+    fi
+    _traffic_save_conf
+    # 重写 server.py 并重启（保持原有其他参数不变）
+    local token="${WEB_TOKEN:-}" port="${WEB_PORT:-${TRAFFIC_WEB_PORT}}"
+    TRAFFIC_WEB_PORT="${port}"
+    _web_write_server "$iface" "$QUOTA_GB" "$RESET_DAY" "$ALERT_PCT" "$token"
+    systemctl restart vps-traffic-web 2>/dev/null
+    echo -e "${GREEN}✓ 偏移已保存，面板已刷新。${NC}"
+    echo -e "  新偏移: 下行 ${CYAN}$(awk "BEGIN{printf \"%.2f GB\", ${OFFSET_RX}/1073741824}")${NC}  上行 ${CYAN}$(awk "BEGIN{printf \"%.2f GB\", ${OFFSET_TX}/1073741824}")${NC}"
+}
+
 manage_traffic_web_menu() {
     while true; do
         echo -e "\n${BLUE}--- Web 流量面板 ---${NC}"
@@ -1971,7 +2021,8 @@ manage_traffic_web_menu() {
         echo -e "4. 查看面板日志"
         echo -e "5. 更新 GeoIP 数据库"
         echo -e "6. 查看采集器状态/日志"
-        echo -e "7. 卸载 Web 面板"
+        echo -e "7. 设置流量偏移（手动补录本月已消耗）"
+        echo -e "8. 卸载 Web 面板"
         echo -e "0. 返回"
         read -p "请选择: " OPT
         case $OPT in
@@ -1981,7 +2032,8 @@ manage_traffic_web_menu() {
             4) journalctl -u vps-traffic-web -n 30 --no-pager ;;
             5) _traffic_update_geoip ;;
             6) echo -e "采集器状态: $(check_status vps-traffic-collector)"; journalctl -u vps-traffic-collector -n 30 --no-pager ;;
-            7) traffic_web_remove ;;
+            7) traffic_web_set_offset ;;
+            8) traffic_web_remove ;;
             0) break ;;
             *) echo "无效选择" ;;
         esac
