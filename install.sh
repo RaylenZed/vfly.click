@@ -1232,14 +1232,29 @@ _hy2_re = re.compile(
 )
 
 def hy2_log_reader():
-    """从 journald 流式读取 Hysteria2 server 日志，提取目标域名写入 pending"""
+    """从 journald 流式读取 Hysteria2 server 日志，提取目标域名写入 pending。
+    Hysteria2 v2 的 MESSAGE 是 bytes 数组（journald JSON 格式），需用 --output=json 解码。"""
+    import json as _json
     while True:
         try:
             proc = subprocess.Popen(
-                ["journalctl", "-u", "hysteria-server", "-f", "-n", "0", "--output", "cat"],
+                ["journalctl", "-u", "hysteria-server", "-f", "-n", "0", "--output", "json"],
                 stdout=subprocess.PIPE, text=True)
             for line in proc.stdout:
-                m = _hy2_re.search(line)
+                try:
+                    entry = _json.loads(line)
+                except Exception:
+                    continue
+                msg = entry.get("MESSAGE", "")
+                if isinstance(msg, list):
+                    # journald 将二进制日志存为 int 数组
+                    try:
+                        msg = bytes(msg).decode("utf-8", errors="replace")
+                    except Exception:
+                        continue
+                if not isinstance(msg, str):
+                    continue
+                m = _hy2_re.search(msg)
                 if not m:
                     continue
                 src_ip, src_port_s, dst_host, dst_port_s = m.groups()
