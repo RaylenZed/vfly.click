@@ -862,6 +862,50 @@ enable_bbr() {
     echo -e "当前状态: ${GREEN}$RESULT${NC}"
 }
 
+# --- 5. IPv6 管理 ---
+
+disable_ipv6() {
+    echo -e "${BLUE}>>> 禁用 IPv6...${NC}"
+    local conf="/etc/sysctl.d/99-disable-ipv6.conf"
+    cat > "$conf" <<EOF
+net.ipv6.conf.all.disable_ipv6 = 1
+net.ipv6.conf.default.disable_ipv6 = 1
+net.ipv6.conf.lo.disable_ipv6 = 1
+EOF
+    sysctl -w net.ipv6.conf.all.disable_ipv6=1 &>/dev/null
+    sysctl -w net.ipv6.conf.default.disable_ipv6=1 &>/dev/null
+    sysctl -w net.ipv6.conf.lo.disable_ipv6=1 &>/dev/null
+    echo -e "${GREEN}IPv6 已禁用（立即生效 + 重启持久化）${NC}"
+    # 重启各协议服务，使其重新绑定到纯 IPv4
+    for svc in xray hysteria-server snell; do
+        if systemctl is-active "$svc" &>/dev/null; then
+            systemctl restart "$svc" &>/dev/null && \
+                echo -e "  已重启 ${CYAN}${svc}${NC}"
+        fi
+    done
+    echo -e "${YELLOW}当前 IPv6 地址列表（应为空）:${NC}"
+    ip -6 addr show scope global 2>/dev/null || echo "  (无)"
+}
+
+enable_ipv6() {
+    echo -e "${BLUE}>>> 启用 IPv6...${NC}"
+    rm -f /etc/sysctl.d/99-disable-ipv6.conf
+    sysctl -w net.ipv6.conf.all.disable_ipv6=0 &>/dev/null
+    sysctl -w net.ipv6.conf.default.disable_ipv6=0 &>/dev/null
+    echo -e "${GREEN}IPv6 已启用（重启后生效）${NC}"
+}
+
+ipv6_status() {
+    local state
+    state=$(sysctl -n net.ipv6.conf.all.disable_ipv6 2>/dev/null)
+    if [[ "$state" == "1" ]]; then
+        echo -e "${YELLOW}IPv6 状态: 已禁用${NC}"
+    else
+        echo -e "${GREEN}IPv6 状态: 已启用${NC}"
+        ip -6 addr show scope global 2>/dev/null | grep "inet6" | awk '{print "  "$2}'
+    fi
+}
+
 # --- 6. Web 流量面板 ---
 
 _traffic_install_collector() {
@@ -2223,6 +2267,8 @@ main_menu() {
         echo -e "7. 开启 BBR 加速"
         echo -e "8. 流量监控 (命令行)"
         echo -e "9. Web 流量面板"
+        echo -e "-------------------------------------"
+        echo -e "10. IPv6 管理 [$(ipv6_status 2>/dev/null | grep -o '已.*')]"
         echo -e "0. 退出脚本"
         echo -e "${BLUE}=====================================${NC}"
         read -p "请输入选项: " CHOICE
@@ -2237,6 +2283,18 @@ main_menu() {
             7) enable_bbr ;;
             8) manage_traffic_menu ;;
             9) manage_traffic_web_menu ;;
+            10)
+                echo -e "\n${BLUE}--- IPv6 管理 ---${NC}"
+                ipv6_status
+                echo "1. 禁用 IPv6"
+                echo "2. 启用 IPv6"
+                echo "0. 返回"
+                read -p "选项: " V6CHOICE
+                case $V6CHOICE in
+                    1) disable_ipv6 ;;
+                    2) enable_ipv6 ;;
+                esac
+                ;;
             0) exit 0 ;;
             *) echo "无效选项"; sleep 1 ;;
         esac
