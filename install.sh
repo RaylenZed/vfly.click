@@ -1143,17 +1143,25 @@ EOF
 _web_write_server() {
     local iface="$1" quota_gb="$2" reset_day="$3" alert_pct="$4" token="$5"
     mkdir -p "$TRAFFIC_WEB_DIR"
-    cat > "$TRAFFIC_WEB_DIR/server.py" <<PYEOF
+
+    # Phase A: bash 变量插值（仅写入配置常量，不含 JS 模板字符串）
+    cat > "$TRAFFIC_WEB_DIR/server.py" <<EOF
 #!/usr/bin/env python3
-import http.server, json, subprocess, os, datetime, urllib.parse, html
+IFACE     = "${iface}"
+QUOTA_GB  = ${quota_gb}
+RESET_DAY = ${reset_day}
+ALERT_PCT = ${alert_pct}
+TOKEN     = "${token}"
+PORT      = ${TRAFFIC_WEB_PORT}
+EOF
 
-IFACE      = "${iface}"
-QUOTA_GB   = ${quota_gb}
-RESET_DAY  = ${reset_day}
-ALERT_PCT  = ${alert_pct}
-TOKEN      = "${token}"
-PORT       = ${TRAFFIC_WEB_PORT}
+    # Phase B: 不插值（单引号 heredoc，JS 模板字符串安全）
+    cat >> "$TRAFFIC_WEB_DIR/server.py" <<'PYEOF'
+import http.server, json, subprocess, os, urllib.parse, hmac, sqlite3
 
+import secrets
+
+# ---- vnstat helpers ----
 def vnstat_json(mode):
     try:
         r = subprocess.run(["vnstat", "-i", IFACE, "--json", mode],
@@ -1162,18 +1170,10 @@ def vnstat_json(mode):
     except Exception:
         return {}
 
-def fmt(b):
-    if b >= 1099511627776: return f"{b/1099511627776:.2f} TB"
-    if b >= 1073741824:    return f"{b/1073741824:.2f} GB"
-    if b >= 1048576:       return f"{b/1048576:.2f} MB"
-    if b >= 1024:          return f"{b/1024:.2f} KB"
-    return f"{b} B"
-
 def get_month_data():
     d = vnstat_json("m")
     try:
-        months = d["interfaces"][0]["traffic"]["month"]
-        cur = months[-1]
+        cur = d["interfaces"][0]["traffic"]["month"][-1]
         return cur.get("rx", 0), cur.get("tx", 0)
     except Exception:
         return 0, 0
@@ -1182,11 +1182,8 @@ def get_day_data(n=30):
     d = vnstat_json("d")
     try:
         days = d["interfaces"][0]["traffic"]["day"][-n:]
-        result = []
-        for day in days:
-            label = f"{day['date']['year']}-{day['date']['month']:02d}-{day['date']['day']:02d}"
-            result.append({"date": label, "rx": day.get("rx", 0), "tx": day.get("tx", 0)})
-        return result
+        return [{"date": f"{x['date']['year']}-{x['date']['month']:02d}-{x['date']['day']:02d}",
+                 "rx": x.get("rx", 0), "tx": x.get("tx", 0)} for x in days]
     except Exception:
         return []
 
@@ -1194,116 +1191,12 @@ def get_all_months():
     d = vnstat_json("m")
     try:
         months = d["interfaces"][0]["traffic"]["month"]
-        result = []
-        for m in months:
-            label = f"{m['date']['year']}-{m['date']['month']:02d}"
-            result.append({"month": label, "rx": m.get("rx", 0), "tx": m.get("tx", 0)})
-        return result
+        return [{"month": f"{m['date']['year']}-{m['date']['month']:02d}",
+                 "rx": m.get("rx", 0), "tx": m.get("tx", 0)} for m in months]
     except Exception:
         return []
 
-HTML = r"""<!DOCTYPE html>
-<html lang="zh">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>VPS 流量监控</title>
-<script src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js"></script>
-<style>
-  *{box-sizing:border-box;margin:0;padding:0}
-  body{background:#0f172a;color:#e2e8f0;font-family:'Segoe UI',system-ui,sans-serif;padding:20px}
-  h1{text-align:center;font-size:1.5rem;margin-bottom:24px;color:#f8fafc}
-  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:16px;margin-bottom:24px}
-  .card{background:#1e293b;border-radius:12px;padding:20px}
-  .card h2{font-size:.85rem;color:#94a3b8;text-transform:uppercase;letter-spacing:.08em;margin-bottom:12px}
-  .big{font-size:2rem;font-weight:700;color:#f1f5f9}
-  .sub{font-size:.8rem;color:#64748b;margin-top:4px}
-  .bar-wrap{background:#0f172a;border-radius:999px;height:10px;margin:10px 0}
-  .bar{height:10px;border-radius:999px;transition:width .5s}
-  .bar.green{background:linear-gradient(90deg,#22c55e,#4ade80)}
-  .bar.yellow{background:linear-gradient(90deg,#eab308,#facc15)}
-  .bar.red{background:linear-gradient(90deg,#ef4444,#f87171)}
-  .stat-row{display:flex;justify-content:space-between;font-size:.85rem;margin-top:6px;color:#94a3b8}
-  .stat-val{color:#e2e8f0;font-weight:600}
-  .chart-card{background:#1e293b;border-radius:12px;padding:20px;margin-bottom:16px}
-  .chart-card h2{font-size:.85rem;color:#94a3b8;text-transform:uppercase;letter-spacing:.08em;margin-bottom:16px}
-  .footer{text-align:center;font-size:.75rem;color:#334155;margin-top:24px}
-  .badge{display:inline-block;padding:2px 8px;border-radius:999px;font-size:.75rem;font-weight:600}
-  .badge.ok{background:#166534;color:#86efac}
-  .badge.warn{background:#713f12;color:#fde68a}
-  .badge.crit{background:#7f1d1d;color:#fca5a5}
-  @media(max-width:600px){.big{font-size:1.5rem}}
-</style>
-</head>
-<body>
-<h1>🖥️ VPS 流量监控</h1>
-<div id="app"><div style="text-align:center;color:#475569;padding:60px">加载中...</div></div>
-<div class="footer">自动刷新 · <span id="ts"></span></div>
-<script>
-const fmt = b => {
-  if(b>=1099511627776) return (b/1099511627776).toFixed(2)+' TB';
-  if(b>=1073741824)    return (b/1073741824).toFixed(2)+' GB';
-  if(b>=1048576)       return (b/1048576).toFixed(2)+' MB';
-  if(b>=1024)          return (b/1024).toFixed(2)+' KB';
-  return b+' B';
-};
-let dayChart=null, monChart=null;
-async function load(){
-  const r = await fetch('REPLACE_API_URL').catch(()=>null);
-  if(!r||!r.ok){document.getElementById('app').innerHTML='<div style="text-align:center;color:#ef4444;padding:60px">数据加载失败</div>';return;}
-  const d = await r.json();
-  const {rx,tx,quota_gb,alert_pct,used_pct,remain,days,months,iface} = d;
-  const total = rx+tx;
-  const barCls = used_pct>=90?'red':used_pct>=alert_pct?'yellow':'green';
-  const badgeCls = used_pct>=90?'crit':used_pct>=alert_pct?'warn':'ok';
-  const badgeTxt = used_pct>=90?'⚠ 严重':used_pct>=alert_pct?'⚠ 告警':'✓ 正常';
-  document.getElementById('app').innerHTML = \`
-  <div class="grid">
-    <div class="card">
-      <h2>本月合计 <span class="badge \${badgeCls}">\${badgeTxt}</span></h2>
-      <div class="big">\${fmt(total)}</div>
-      <div class="sub">接口: \${iface}</div>
-      <div class="bar-wrap"><div class="bar \${barCls}" style="width:\${Math.min(used_pct,100)}%"></div></div>
-      <div class="stat-row"><span>已用 \${used_pct}%</span><span class="stat-val">剩余 \${fmt(remain)}</span></div>
-      <div class="stat-row"><span>配额</span><span class="stat-val">\${quota_gb} GB</span></div>
-    </div>
-    <div class="card">
-      <h2>上传 / 下载</h2>
-      <div class="big">\${fmt(tx)}</div><div class="sub">↑ 上传</div>
-      <div style="margin-top:14px"><div class="big">\${fmt(rx)}</div><div class="sub">↓ 下载</div></div>
-    </div>
-    <div class="card">
-      <h2>今日用量</h2>
-      <div class="big">\${days.length?fmt(days[days.length-1].rx+days[days.length-1].tx):'--'}</div>
-      <div class="sub">↑ \${days.length?fmt(days[days.length-1].tx):'--'} &nbsp; ↓ \${days.length?fmt(days[days.length-1].rx):'--'}</div>
-    </div>
-  </div>
-  <div class="chart-card"><h2>近 30 天日流量</h2><canvas id="dayChart" height="80"></canvas></div>
-  <div class="chart-card"><h2>月度流量历史</h2><canvas id="monChart" height="80"></canvas></div>
-  \`;
-
-  if(dayChart){dayChart.destroy();dayChart=null;}
-  if(monChart){monChart.destroy();monChart=null;}
-
-  const dLabels=days.map(d=>d.date.slice(5));
-  dayChart=new Chart(document.getElementById('dayChart'),{type:'bar',data:{labels:dLabels,datasets:[
-    {label:'上传',data:days.map(d=>+(d.tx/1073741824).toFixed(3)),backgroundColor:'rgba(99,102,241,.7)',borderRadius:3},
-    {label:'下载',data:days.map(d=>+(d.rx/1073741824).toFixed(3)),backgroundColor:'rgba(34,197,94,.7)',borderRadius:3}
-  ]},options:{plugins:{legend:{labels:{color:'#94a3b8'}}},scales:{x:{ticks:{color:'#64748b',maxRotation:45}},y:{ticks:{color:'#64748b',callback:v=>v+'GB'}}}}});
-
-  const mLabels=months.map(m=>m.month);
-  monChart=new Chart(document.getElementById('monChart'),{type:'bar',data:{labels:mLabels,datasets:[
-    {label:'上传',data:months.map(m=>+(m.tx/1073741824).toFixed(3)),backgroundColor:'rgba(99,102,241,.7)',borderRadius:3},
-    {label:'下载',data:months.map(m=>+(m.rx/1073741824).toFixed(3)),backgroundColor:'rgba(34,197,94,.7)',borderRadius:3}
-  ]},options:{plugins:{legend:{labels:{color:'#94a3b8'}}},scales:{x:{ticks:{color:'#64748b'}},y:{ticks:{color:'#64748b',callback:v=>v+'GB'}}}}});
-
-  document.getElementById('ts').textContent=new Date().toLocaleString('zh-CN');
-}
-load();
-setInterval(load,60000);
-</script>
-</body></html>
-"""
+# (old single-panel HTML removed — replaced by HTML below)
 
 DB_PATH = "/var/lib/vps-traffic/flows.db"
 
@@ -1400,7 +1293,7 @@ def flows_recent(limit=100):
     finally:
         conn.close()
 
-HTML2 = r"""<!DOCTYPE html>
+HTML = r"""<!DOCTYPE html>
 <html lang="zh">
 <head>
 <meta charset="UTF-8">
@@ -1408,298 +1301,376 @@ HTML2 = r"""<!DOCTYPE html>
 <title>VPS 流量监控</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js"></script>
 <style>
+:root{
+  --bg:#0f172a;--surface:#1e293b;--surface2:#263348;--border:#334155;
+  --text:#e2e8f0;--text-sub:#94a3b8;--text-muted:#64748b;
+  --accent:#6366f1;--sidebar-w:220px;
+}
+html.light{
+  --bg:#f1f5f9;--surface:#ffffff;--surface2:#f8fafc;--border:#e2e8f0;
+  --text:#0f172a;--text-sub:#475569;--text-muted:#94a3b8;
+}
 *{box-sizing:border-box;margin:0;padding:0}
-body{background:#0f172a;color:#e2e8f0;font-family:'Segoe UI',system-ui,sans-serif;padding:16px}
-h1{text-align:center;font-size:1.4rem;margin-bottom:16px;color:#f8fafc}
-.tabs{display:flex;gap:4px;margin-bottom:20px;border-bottom:1px solid #1e293b;padding-bottom:0}
-.tab{padding:8px 18px;border-radius:8px 8px 0 0;cursor:pointer;font-size:.85rem;color:#64748b;border:1px solid transparent;border-bottom:none;background:transparent;transition:all .2s}
-.tab.active{background:#1e293b;color:#f1f5f9;border-color:#334155}
-.tab:hover:not(.active){color:#94a3b8}
+body{background:var(--bg);color:var(--text);font-family:'Segoe UI',system-ui,sans-serif;display:flex;min-height:100vh;transition:background .3s,color .3s}
+#sidebar{width:var(--sidebar-w);background:var(--surface);border-right:1px solid var(--border);display:flex;flex-direction:column;flex-shrink:0;transition:transform .3s,background .3s}
+.sidebar-logo{padding:18px 16px 14px;border-bottom:1px solid var(--border);font-weight:700;font-size:.95rem;color:var(--text);display:flex;align-items:center;gap:8px}
+.nav-section{padding:12px 12px 4px;font-size:.65rem;text-transform:uppercase;letter-spacing:.1em;color:var(--text-muted);font-weight:600}
+.nav-item{display:flex;align-items:center;gap:10px;padding:8px 14px;border-radius:8px;margin:1px 8px;cursor:pointer;font-size:.86rem;color:var(--text-sub);transition:all .15s;border:none;background:none;width:calc(100% - 16px);text-align:left}
+.nav-item:hover{background:var(--surface2);color:var(--text)}
+.nav-item.active{background:var(--accent);color:#fff;font-weight:600}
+.nav-item .icon{font-size:.95rem;width:18px;text-align:center;flex-shrink:0}
+.sidebar-footer{margin-top:auto;padding:10px 14px;border-top:1px solid var(--border);display:flex;align-items:center;justify-content:space-between}
+.theme-btn{background:none;border:1px solid var(--border);color:var(--text-sub);padding:4px 10px;border-radius:6px;cursor:pointer;font-size:.78rem;transition:all .15s}
+.theme-btn:hover{background:var(--surface2);color:var(--text)}
+#main{flex:1;display:flex;flex-direction:column;min-width:0}
+#topbar{height:52px;border-bottom:1px solid var(--border);display:flex;align-items:center;padding:0 20px;gap:10px;background:var(--surface);flex-shrink:0;transition:background .3s}
+.hamburger{display:none;background:none;border:none;color:var(--text);cursor:pointer;font-size:1.3rem;padding:4px}
+.topbar-title{font-weight:600;font-size:.95rem;color:var(--text)}
+.topbar-sub{font-size:.75rem;color:var(--text-muted);margin-left:auto}
+#content{flex:1;padding:20px;overflow-y:auto}
 .panel{display:none}.panel.active{display:block}
-.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:14px;margin-bottom:20px}
-.card{background:#1e293b;border-radius:12px;padding:18px}
-.card h2{font-size:.78rem;color:#94a3b8;text-transform:uppercase;letter-spacing:.08em;margin-bottom:10px}
-.big{font-size:1.8rem;font-weight:700;color:#f1f5f9}
-.sub{font-size:.78rem;color:#64748b;margin-top:4px}
-.bar-wrap{background:#0f172a;border-radius:999px;height:8px;margin:10px 0}
-.bar{height:8px;border-radius:999px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:14px;margin-bottom:18px}
+.card{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:18px;transition:background .3s}
+.card h3{font-size:.72rem;color:var(--text-muted);text-transform:uppercase;letter-spacing:.08em;margin-bottom:10px;font-weight:600}
+.big{font-size:1.9rem;font-weight:700;color:var(--text)}
+.sub{font-size:.76rem;color:var(--text-muted);margin-top:4px}
+.bar-wrap{background:var(--bg);border-radius:999px;height:7px;margin:10px 0}
+.bar{height:7px;border-radius:999px;transition:width .5s}
 .bar.green{background:linear-gradient(90deg,#22c55e,#4ade80)}
 .bar.yellow{background:linear-gradient(90deg,#eab308,#facc15)}
 .bar.red{background:linear-gradient(90deg,#ef4444,#f87171)}
-.stat-row{display:flex;justify-content:space-between;font-size:.82rem;margin-top:5px;color:#94a3b8}
-.stat-val{color:#e2e8f0;font-weight:600}
-.chart-card{background:#1e293b;border-radius:12px;padding:18px;margin-bottom:14px}
-.chart-card h2{font-size:.78rem;color:#94a3b8;text-transform:uppercase;letter-spacing:.08em;margin-bottom:14px}
-.badge{display:inline-block;padding:2px 8px;border-radius:999px;font-size:.72rem;font-weight:600}
+.stat-row{display:flex;justify-content:space-between;font-size:.8rem;margin-top:5px;color:var(--text-sub)}
+.stat-val{color:var(--text);font-weight:600}
+.badge{display:inline-block;padding:2px 8px;border-radius:999px;font-size:.7rem;font-weight:600}
 .badge.ok{background:#166534;color:#86efac}.badge.warn{background:#713f12;color:#fde68a}.badge.crit{background:#7f1d1d;color:#fca5a5}
-.range-bar{display:flex;gap:6px;margin-bottom:16px;flex-wrap:wrap}
-.range-btn{padding:4px 12px;border-radius:6px;font-size:.78rem;cursor:pointer;border:1px solid #334155;background:transparent;color:#64748b}
-.range-btn.active{background:#334155;color:#f1f5f9}
-table{width:100%;border-collapse:collapse;font-size:.82rem}
-th{text-align:left;padding:8px 10px;color:#64748b;border-bottom:1px solid #1e293b;font-weight:500}
-td{padding:7px 10px;border-bottom:1px solid #0f172a;color:#cbd5e1}
-tr:hover td{background:#1e293b}
-.bytes-bar{display:inline-block;height:6px;background:#6366f1;border-radius:3px;vertical-align:middle;margin-left:6px}
-.dir-in{color:#34d399}.dir-out{color:#60a5fa}
-.footer{text-align:center;font-size:.72rem;color:#334155;margin-top:20px}
-select{background:#1e293b;border:1px solid #334155;color:#e2e8f0;padding:4px 10px;border-radius:6px;font-size:.82rem}
-@media(max-width:600px){.big{font-size:1.4rem}.tabs{flex-wrap:wrap}}
+.chart-card{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:18px;margin-bottom:14px;transition:background .3s}
+.chart-card h3{font-size:.72rem;color:var(--text-muted);text-transform:uppercase;letter-spacing:.08em;margin-bottom:14px;font-weight:600}
+table{width:100%;border-collapse:collapse;font-size:.81rem}
+th{text-align:left;padding:8px 10px;color:var(--text-muted);border-bottom:1px solid var(--border);font-weight:500;font-size:.72rem}
+td{padding:7px 10px;border-bottom:1px solid var(--border);color:var(--text-sub)}
+tr:last-child td{border-bottom:none}
+tr:hover td{background:var(--surface2)}
+.bytes-bar{display:inline-block;height:4px;background:var(--accent);border-radius:2px;vertical-align:middle;margin-left:8px;opacity:.7}
+.dir-in{color:#34d399;font-weight:600}.dir-out{color:#60a5fa;font-weight:600}
+.range-bar{display:flex;gap:6px;margin-bottom:14px;flex-wrap:wrap;align-items:center}
+.range-label{font-size:.76rem;color:var(--text-muted)}
+.range-btn{padding:4px 11px;border-radius:6px;font-size:.76rem;cursor:pointer;border:1px solid var(--border);background:transparent;color:var(--text-muted);transition:all .15s}
+.range-btn.active,.range-btn:hover{background:var(--surface2);color:var(--text);border-color:var(--accent)}
+.two-col{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:14px}
+#login-overlay{position:fixed;inset:0;background:rgba(0,0,0,.75);backdrop-filter:blur(6px);display:flex;align-items:center;justify-content:center;z-index:9999}
+#login-box{background:var(--surface);border:1px solid var(--border);border-radius:16px;padding:36px;width:340px;max-width:90vw}
+#login-box h2{font-size:1.15rem;font-weight:700;color:var(--text);margin-bottom:6px}
+#login-box p{font-size:.82rem;color:var(--text-muted);margin-bottom:22px}
+#login-box input{width:100%;padding:10px 14px;background:var(--bg);border:1px solid var(--border);border-radius:8px;color:var(--text);font-size:.88rem;outline:none;margin-bottom:10px}
+#login-box input:focus{border-color:var(--accent)}
+#login-btn{width:100%;padding:10px;background:var(--accent);color:#fff;border:none;border-radius:8px;font-size:.88rem;font-weight:600;cursor:pointer;transition:opacity .15s}
+#login-btn:hover{opacity:.9}
+#login-err{font-size:.78rem;color:#f87171;margin-top:8px;text-align:center;display:none}
+.loading{text-align:center;color:var(--text-muted);padding:40px}
+@media(max-width:768px){
+  #sidebar{position:fixed;top:0;left:0;height:100vh;z-index:100;transform:translateX(-100%)}
+  #sidebar.open{transform:translateX(0)}
+  .hamburger{display:block}
+  .two-col{grid-template-columns:1fr}
+  #content{padding:14px}
+}
 </style>
 </head>
 <body>
-<h1>🖥️ VPS 流量监控</h1>
-<div class="tabs">
-  <div class="tab active" onclick="switchTab('overview',this)">总览</div>
-  <div class="tab" onclick="switchTab('outbound',this)">出站详情</div>
-  <div class="tab" onclick="switchTab('inbound',this)">入站详情</div>
-  <div class="tab" onclick="switchTab('live',this)">实时流水</div>
-</div>
-
-<!-- 总览 -->
-<div class="panel active" id="panel-overview">
-  <div id="overview-content"><div style="text-align:center;color:#475569;padding:40px">加载中...</div></div>
-</div>
-
-<!-- 出站详情 -->
-<div class="panel" id="panel-outbound">
-  <div class="range-bar">
-    <span style="color:#94a3b8;font-size:.8rem;align-self:center">时间范围:</span>
-    <button class="range-btn active" onclick="setRange('out','today',this)">今日</button>
-    <button class="range-btn" onclick="setRange('out','7d',this)">7天</button>
-    <button class="range-btn" onclick="setRange('out','30d',this)">30天</button>
-    <button class="range-btn" onclick="setRange('out','6m',this)">6个月</button>
+<div id="login-overlay">
+  <div id="login-box">
+    <h2>VPS 流量监控</h2>
+    <p>请输入访问密码</p>
+    <input type="password" id="pwd-input" placeholder="密码" autofocus>
+    <button id="login-btn" onclick="doLogin()">登 录</button>
+    <div id="login-err">密码错误，请重试</div>
   </div>
-  <div id="outbound-content"><div style="text-align:center;color:#475569;padding:40px">加载中...</div></div>
 </div>
-
-<!-- 入站详情 -->
-<div class="panel" id="panel-inbound">
-  <div class="range-bar">
-    <span style="color:#94a3b8;font-size:.8rem;align-self:center">时间范围:</span>
-    <button class="range-btn active" onclick="setRange('in','today',this)">今日</button>
-    <button class="range-btn" onclick="setRange('in','7d',this)">7天</button>
-    <button class="range-btn" onclick="setRange('in','30d',this)">30天</button>
-    <button class="range-btn" onclick="setRange('in','6m',this)">6个月</button>
+<nav id="sidebar">
+  <div class="sidebar-logo"><span>🖥️</span>VPS 监控</div>
+  <div class="nav-section">监控面板</div>
+  <button class="nav-item active" onclick="switchTab('overview',this)"><span class="icon">📊</span>总览</button>
+  <button class="nav-item" onclick="switchTab('outbound',this)"><span class="icon">↑</span>出站详情</button>
+  <button class="nav-item" onclick="switchTab('inbound',this)"><span class="icon">↓</span>入站详情</button>
+  <button class="nav-item" onclick="switchTab('live',this)"><span class="icon">⚡</span>实时流水</button>
+  <div class="sidebar-footer">
+    <span style="font-size:.72rem;color:var(--text-muted)" id="footer-ts"></span>
+    <button class="theme-btn" id="theme-btn" onclick="toggleTheme()">🌙</button>
   </div>
-  <div id="inbound-content"><div style="text-align:center;color:#475569;padding:40px">加载中...</div></div>
+</nav>
+<div id="main">
+  <header id="topbar">
+    <button class="hamburger" onclick="toggleSidebar()">☰</button>
+    <span class="topbar-title" id="topbar-title">总览</span>
+    <span class="topbar-sub" id="topbar-sub"></span>
+  </header>
+  <div id="content">
+    <div class="panel active" id="panel-overview"><div class="loading">加载中...</div></div>
+    <div class="panel" id="panel-outbound">
+      <div class="range-bar">
+        <span class="range-label">时间范围:</span>
+        <button class="range-btn active" onclick="setRange('out','today',this)">今日</button>
+        <button class="range-btn" onclick="setRange('out','7d',this)">7天</button>
+        <button class="range-btn" onclick="setRange('out','30d',this)">30天</button>
+        <button class="range-btn" onclick="setRange('out','6m',this)">6个月</button>
+      </div>
+      <div id="outbound-content"><div class="loading">加载中...</div></div>
+    </div>
+    <div class="panel" id="panel-inbound">
+      <div class="range-bar">
+        <span class="range-label">时间范围:</span>
+        <button class="range-btn active" onclick="setRange('in','today',this)">今日</button>
+        <button class="range-btn" onclick="setRange('in','7d',this)">7天</button>
+        <button class="range-btn" onclick="setRange('in','30d',this)">30天</button>
+        <button class="range-btn" onclick="setRange('in','6m',this)">6个月</button>
+      </div>
+      <div id="inbound-content"><div class="loading">加载中...</div></div>
+    </div>
+    <div class="panel" id="panel-live"><div id="live-content"><div class="loading">加载中...</div></div></div>
+  </div>
 </div>
-
-<!-- 实时流水 -->
-<div class="panel" id="panel-live">
-  <div id="live-content"><div style="text-align:center;color:#475569;padding:40px">加载中...</div></div>
-</div>
-
-<div class="footer">自动刷新 · <span id="ts"></span></div>
-
 <script>
-const TOKEN_PARAM = "REPLACE_TOKEN_PARAM";
-const BASE = "";
-const fmt = b => {
-  if(!b) return "—";
-  if(b>=1099511627776) return (b/1099511627776).toFixed(2)+" TB";
-  if(b>=1073741824)    return (b/1073741824).toFixed(2)+" GB";
-  if(b>=1048576)       return (b/1048576).toFixed(2)+" MB";
-  if(b>=1024)          return (b/1024).toFixed(2)+" KB";
+let _tok = sessionStorage.getItem("vps_tok") || "";
+async function doLogin() {
+  const pwd = document.getElementById("pwd-input").value;
+  const r = await fetch("/auth",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({password:pwd})}).catch(()=>null);
+  if(r&&r.ok){
+    const d=await r.json();
+    _tok=d.token; sessionStorage.setItem("vps_tok",_tok);
+    document.getElementById("login-overlay").style.display="none";
+    initApp();
+  } else {
+    document.getElementById("login-err").style.display="block";
+    document.getElementById("pwd-input").value="";
+    document.getElementById("pwd-input").focus();
+  }
+}
+document.getElementById("pwd-input").addEventListener("keydown",e=>{if(e.key==="Enter")doLogin();});
+async function checkAuth(){
+  if(!_tok) return false;
+  const r=await fetch("/api",{headers:{"Authorization":"Bearer "+_tok}}).catch(()=>null);
+  return r&&r.ok;
+}
+const api=async path=>{
+  const r=await fetch(path,{headers:{"Authorization":"Bearer "+_tok}}).catch(()=>null);
+  if(r&&r.status===401){_tok="";sessionStorage.removeItem("vps_tok");location.reload();return null;}
+  return r&&r.ok?r.json():null;
+};
+function toggleTheme(){
+  const isLight=document.documentElement.classList.contains("light");
+  document.documentElement.classList.toggle("light",!isLight);
+  document.documentElement.classList.toggle("dark",isLight);
+  localStorage.setItem("theme",isLight?"dark":"light");
+  document.getElementById("theme-btn").textContent=isLight?"🌙":"☀️";
+}
+(function(){
+  const t=localStorage.getItem("theme")||"dark";
+  document.documentElement.classList.add(t);
+  if(t==="light")document.getElementById("theme-btn").textContent="☀️";
+})();
+function toggleSidebar(){document.getElementById("sidebar").classList.toggle("open");}
+const fmt=b=>{
+  if(!b)return "—";
+  if(b>=1099511627776)return (b/1099511627776).toFixed(2)+" TB";
+  if(b>=1073741824)return (b/1073741824).toFixed(2)+" GB";
+  if(b>=1048576)return (b/1048576).toFixed(2)+" MB";
+  if(b>=1024)return (b/1024).toFixed(2)+" KB";
   return b+" B";
 };
-const api = async path => {
-  const sep = path.includes("?") ? "&" : "?";
-  const r = await fetch(BASE+path+(TOKEN_PARAM?sep+TOKEN_PARAM:"")).catch(()=>null);
-  return r&&r.ok ? r.json() : null;
-};
-
-let activeTab = "overview";
-let ranges = {out:"today", in:"today"};
-let charts = {};
-
-function switchTab(name, el) {
-  document.querySelectorAll(".tab").forEach(t=>t.classList.remove("active"));
+const TAB_TITLES={overview:"总览",outbound:"出站详情",inbound:"入站详情",live:"实时流水"};
+let activeTab="overview",ranges={out:"today",in:"today"},charts={};
+function switchTab(name,el){
+  document.querySelectorAll(".nav-item").forEach(t=>t.classList.remove("active"));
   document.querySelectorAll(".panel").forEach(p=>p.classList.remove("active"));
   el.classList.add("active");
   document.getElementById("panel-"+name).classList.add("active");
-  activeTab = name;
-  loadTab(name);
+  document.getElementById("topbar-title").textContent=TAB_TITLES[name]||name;
+  activeTab=name; loadTab(name);
+  if(window.innerWidth<=768)document.getElementById("sidebar").classList.remove("open");
 }
-
-function setRange(dir, r, el) {
+function setRange(dir,r,el){
   el.closest(".range-bar").querySelectorAll(".range-btn").forEach(b=>b.classList.remove("active"));
-  el.classList.add("active");
-  ranges[dir] = r;
+  el.classList.add("active"); ranges[dir]=r;
   loadTab(dir==="out"?"outbound":"inbound");
 }
-
-async function loadTab(name) {
-  if(name==="overview") await loadOverview();
-  else if(name==="outbound") await loadDirectional("out");
-  else if(name==="inbound") await loadDirectional("in");
-  else if(name==="live") await loadLive();
-  document.getElementById("ts").textContent = new Date().toLocaleString("zh-CN");
+async function loadTab(name){
+  if(name==="overview")await loadOverview();
+  else if(name==="outbound")await loadDirectional("out");
+  else if(name==="inbound")await loadDirectional("in");
+  else if(name==="live")await loadLive();
+  const now=new Date().toLocaleString("zh-CN");
+  document.getElementById("footer-ts").textContent=now;
+  document.getElementById("topbar-sub").textContent="更新: "+now;
 }
-
-// ---- 总览 ----
-let dayChart=null, monChart=null;
-async function loadOverview() {
-  const d = await api("/api");
-  if(!d){document.getElementById("overview-content").innerHTML="<div style='text-align:center;color:#ef4444;padding:40px'>数据加载失败</div>";return;}
-  const {rx,tx,quota_gb,alert_pct,used_pct,remain,days,months,iface} = d;
-  const total=rx+tx, barCls=used_pct>=90?"red":used_pct>=alert_pct?"yellow":"green";
+const isDark=()=>!document.documentElement.classList.contains("light");
+const tickColor=()=>isDark()?"#64748b":"#94a3b8";
+const legColor=()=>isDark()?"#94a3b8":"#475569";
+async function loadOverview(){
+  const d=await api("/api");
+  const el=document.getElementById("panel-overview");
+  if(!d){el.innerHTML="<div class='loading' style='color:#ef4444'>数据加载失败</div>";return;}
+  const {rx,tx,quota_gb,alert_pct,used_pct,remain,days,months,iface}=d;
+  const total=rx+tx,barCls=used_pct>=90?"red":used_pct>=alert_pct?"yellow":"green";
   const badgeCls=used_pct>=90?"crit":used_pct>=alert_pct?"warn":"ok";
   const badgeTxt=used_pct>=90?"⚠ 严重":used_pct>=alert_pct?"⚠ 告警":"✓ 正常";
-  document.getElementById("overview-content").innerHTML=`
+  el.innerHTML=`
   <div class="grid">
-    <div class="card"><h2>本月合计 <span class="badge ${badgeCls}">${badgeTxt}</span></h2>
+    <div class="card"><h3>本月合计 <span class="badge ${badgeCls}">${badgeTxt}</span></h3>
       <div class="big">${fmt(total)}</div><div class="sub">接口: ${iface}</div>
       <div class="bar-wrap"><div class="bar ${barCls}" style="width:${Math.min(used_pct,100)}%"></div></div>
       <div class="stat-row"><span>已用 ${used_pct}%</span><span class="stat-val">剩余 ${fmt(remain)}</span></div>
       <div class="stat-row"><span>配额</span><span class="stat-val">${quota_gb} GB</span></div>
     </div>
-    <div class="card"><h2>上传 / 下载</h2>
+    <div class="card"><h3>上传 / 下载</h3>
       <div class="big">${fmt(tx)}</div><div class="sub">↑ 上传</div>
       <div style="margin-top:12px"><div class="big">${fmt(rx)}</div><div class="sub">↓ 下载</div></div>
     </div>
-    <div class="card"><h2>今日用量</h2>
+    <div class="card"><h3>今日用量</h3>
       <div class="big">${days.length?fmt(days[days.length-1].rx+days[days.length-1].tx):"--"}</div>
       <div class="sub">↑ ${days.length?fmt(days[days.length-1].tx):"--"} &nbsp; ↓ ${days.length?fmt(days[days.length-1].rx):"--"}</div>
     </div>
   </div>
-  <div class="chart-card"><h2>近 30 天日流量</h2><canvas id="dayChart" height="70"></canvas></div>
-  <div class="chart-card"><h2>月度流量历史</h2><canvas id="monChart" height="70"></canvas></div>`;
-  if(charts.day){charts.day.destroy();} if(charts.mon){charts.mon.destroy();}
-  const dL=days.map(d=>d.date.slice(5));
-  charts.day=new Chart(document.getElementById("dayChart"),{type:"bar",data:{labels:dL,datasets:[
+  <div class="chart-card"><h3>近 30 天日流量</h3><canvas id="dayChart" height="70"></canvas></div>
+  <div class="chart-card"><h3>月度流量历史</h3><canvas id="monChart" height="70"></canvas></div>`;
+  if(charts.day)charts.day.destroy(); if(charts.mon)charts.mon.destroy();
+  charts.day=new Chart(document.getElementById("dayChart"),{type:"bar",data:{labels:days.map(d=>d.date.slice(5)),datasets:[
     {label:"上传",data:days.map(d=>+(d.tx/1073741824).toFixed(3)),backgroundColor:"rgba(99,102,241,.7)",borderRadius:3},
     {label:"下载",data:days.map(d=>+(d.rx/1073741824).toFixed(3)),backgroundColor:"rgba(34,197,94,.7)",borderRadius:3}
-  ]},options:{plugins:{legend:{labels:{color:"#94a3b8"}}},scales:{x:{ticks:{color:"#64748b",maxRotation:45}},y:{ticks:{color:"#64748b",callback:v=>v+"GB"}}}}});
-  const mL=months.map(m=>m.month);
-  charts.mon=new Chart(document.getElementById("monChart"),{type:"bar",data:{labels:mL,datasets:[
+  ]},options:{plugins:{legend:{labels:{color:legColor()}}},scales:{x:{ticks:{color:tickColor(),maxRotation:45}},y:{ticks:{color:tickColor(),callback:v=>v+"GB"}}}}});
+  charts.mon=new Chart(document.getElementById("monChart"),{type:"bar",data:{labels:months.map(m=>m.month),datasets:[
     {label:"上传",data:months.map(m=>+(m.tx/1073741824).toFixed(3)),backgroundColor:"rgba(99,102,241,.7)",borderRadius:3},
     {label:"下载",data:months.map(m=>+(m.rx/1073741824).toFixed(3)),backgroundColor:"rgba(34,197,94,.7)",borderRadius:3}
-  ]},options:{plugins:{legend:{labels:{color:"#94a3b8"}}},scales:{x:{ticks:{color:"#64748b"}},y:{ticks:{color:"#64748b",callback:v=>v+"GB"}}}}});
+  ]},options:{plugins:{legend:{labels:{color:legColor()}}},scales:{x:{ticks:{color:tickColor()}},y:{ticks:{color:tickColor(),callback:v=>v+"GB"}}}}});
 }
-
-// ---- 出站 / 入站 ----
-async function loadDirectional(dir) {
-  const range = ranges[dir];
-  const id = dir==="out" ? "outbound-content" : "inbound-content";
-  const [summary, topHost, topCountry, topIp, timeline] = await Promise.all([
+async function loadDirectional(dir){
+  const range=ranges[dir],id=dir==="out"?"outbound-content":"inbound-content";
+  const [summary,topHost,topCountry,topIp,timeline]=await Promise.all([
     api(`/api/flows/summary?range=${range}&direction=${dir}`),
     api(`/api/flows/top?field=host&range=${range}&direction=${dir}&limit=30`),
     api(`/api/flows/top?field=country&range=${range}&direction=${dir}&limit=15`),
     api(`/api/flows/top?field=${dir==="out"?"dst_ip":"src_ip"}&range=${range}&direction=${dir}&limit=20`),
     api(`/api/flows/timeline?range=${range}&direction=${dir}`),
   ]);
-  const s = summary || {connections:0,bytes_up:0,bytes_down:0};
-  const totalBytes = s.bytes_up + s.bytes_down;
-  const maxBytes = (topHost&&topHost.length) ? topHost[0].bytes : 1;
-  const label = dir==="out" ? "目标域名 / IP" : "来源 IP";
-  const ipField = dir==="out" ? "目标 IP" : "来源 IP";
-
-  let hostRows = (topHost||[]).map(r=>`<tr>
-    <td>${r.label||"—"}</td>
-    <td>${r.cnt}</td>
-    <td>${fmt(r.bytes)}<span class="bytes-bar" style="width:${Math.round(r.bytes/maxBytes*80)}px"></span></td>
-  </tr>`).join("");
-  let ipRows = (topIp||[]).map(r=>`<tr>
-    <td>${r.label||"—"}</td><td>${r.cnt}</td><td>${fmt(r.bytes)}</td>
-  </tr>`).join("");
-  let countryRows = (topCountry||[]).map(r=>`<tr>
-    <td>${r.label||"未知"}</td><td>${r.cnt}</td><td>${fmt(r.bytes)}</td>
-  </tr>`).join("");
-
+  const s=summary||{connections:0,bytes_up:0,bytes_down:0};
+  const totalBytes=s.bytes_up+s.bytes_down,maxBytes=(topHost&&topHost.length)?topHost[0].bytes:1;
+  const label=dir==="out"?"目标域名 / IP":"来源 IP",ipField=dir==="out"?"目标 IP":"来源 IP";
+  const empty=col=>`<tr><td colspan="${col}" style="text-align:center;color:var(--text-muted);padding:14px">暂无数据</td></tr>`;
+  const hostRows=(topHost||[]).map(r=>`<tr><td>${r.label||"—"}</td><td>${r.cnt}</td><td>${fmt(r.bytes)}<span class="bytes-bar" style="width:${Math.round(r.bytes/maxBytes*60)}px"></span></td></tr>`).join("");
+  const ipRows=(topIp||[]).map(r=>`<tr><td>${r.label||"—"}</td><td>${r.cnt}</td><td>${fmt(r.bytes)}</td></tr>`).join("");
+  const countryRows=(topCountry||[]).map(r=>`<tr><td>${r.label||"未知"}</td><td>${r.cnt}</td><td>${fmt(r.bytes)}</td></tr>`).join("");
   document.getElementById(id).innerHTML=`
   <div class="grid">
-    <div class="card"><h2>${dir==="out"?"出站总计":"入站总计"}</h2>
+    <div class="card"><h3>${dir==="out"?"出站总计":"入站总计"}</h3>
       <div class="big">${fmt(totalBytes)}</div>
       <div class="stat-row"><span>连接数</span><span class="stat-val">${s.connections.toLocaleString()}</span></div>
       <div class="stat-row"><span>上行</span><span class="stat-val">${fmt(s.bytes_up)}</span></div>
       <div class="stat-row"><span>下行</span><span class="stat-val">${fmt(s.bytes_down)}</span></div>
     </div>
   </div>
-  <div class="chart-card"><h2>流量趋势</h2><canvas id="chart-${dir}" height="60"></canvas></div>
-  <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:14px">
-    <div class="chart-card"><h2>Top 国家</h2>
-      <table><thead><tr><th>国家</th><th>次数</th><th>流量</th></tr></thead>
-      <tbody>${countryRows||"<tr><td colspan=3 style='color:#475569;text-align:center'>暂无数据</td></tr>"}</tbody></table>
+  <div class="chart-card"><h3>流量趋势</h3><canvas id="chart-${dir}" height="60"></canvas></div>
+  <div class="two-col">
+    <div class="chart-card"><h3>Top 国家</h3>
+      <table><thead><tr><th>国家</th><th>次数</th><th>流量</th></tr></thead><tbody>${countryRows||empty(3)}</tbody></table>
     </div>
-    <div class="chart-card"><h2>Top ${ipField}</h2>
-      <table><thead><tr><th>IP</th><th>次数</th><th>流量</th></tr></thead>
-      <tbody>${ipRows||"<tr><td colspan=3 style='color:#475569;text-align:center'>暂无数据</td></tr>"}</tbody></table>
+    <div class="chart-card"><h3>Top ${ipField}</h3>
+      <table><thead><tr><th>IP</th><th>次数</th><th>流量</th></tr></thead><tbody>${ipRows||empty(3)}</tbody></table>
     </div>
   </div>
-  <div class="chart-card"><h2>Top ${label}</h2>
-    <table><thead><tr><th>域名 / IP</th><th>次数</th><th>流量</th></tr></thead>
-    <tbody>${hostRows||"<tr><td colspan=3 style='color:#475569;text-align:center'>暂无数据（需等待采集器收集数据）</td></tr>"}</tbody></table>
+  <div class="chart-card"><h3>Top ${label}</h3>
+    <table><thead><tr><th>域名 / IP</th><th>次数</th><th>流量</th></tr></thead><tbody>${hostRows||empty(3)}</tbody></table>
   </div>`;
-
-  // 趋势图
-  const cid = `chart-${dir}`;
-  if(charts[cid]) charts[cid].destroy();
-  const tl = timeline || [];
+  const cid=`chart-${dir}`;
+  if(charts[cid])charts[cid].destroy();
+  const tl=timeline||[];
   charts[cid]=new Chart(document.getElementById(cid),{type:"bar",data:{
     labels:tl.map(r=>r.t.slice(5)),
     datasets:[{label:"流量",data:tl.map(r=>+(r.bytes/1073741824).toFixed(3)),backgroundColor:"rgba(99,102,241,.7)",borderRadius:3}]
-  },options:{plugins:{legend:{display:false}},scales:{x:{ticks:{color:"#64748b",maxRotation:45}},y:{ticks:{color:"#64748b",callback:v=>v+"GB"}}}}});
+  },options:{plugins:{legend:{display:false}},scales:{x:{ticks:{color:tickColor(),maxRotation:45}},y:{ticks:{color:tickColor(),callback:v=>v+"GB"}}}}});
 }
-
-// ---- 实时流水 ----
-async function loadLive() {
-  const rows = await api("/api/flows/recent?limit=100") || [];
-  const tbody = rows.map(r=>{
-    const ts = new Date(r.ts*1000).toLocaleTimeString("zh-CN");
-    const dirLabel = r.direction==="in"?`<span class="dir-in">↓入站</span>`:`<span class="dir-out">↑出站</span>`;
-    const host = r.host || r.dst_ip || "—";
-    const bytes = fmt((r.bytes_up||0)+(r.bytes_down||0));
-    return `<tr>
-      <td>${ts}</td><td>${dirLabel}</td>
-      <td>${r.src_ip||"—"}</td>
-      <td>${host}${r.dst_port?":"+r.dst_port:""}</td>
-      <td>${r.country||"—"}</td>
-      <td>${bytes}</td>
-    </tr>`;
+async function loadLive(){
+  const rows=await api("/api/flows/recent?limit=100")||[];
+  const tbody=rows.map(r=>{
+    const ts=new Date(r.ts*1000).toLocaleTimeString("zh-CN");
+    const dirLabel=r.direction==="in"?`<span class="dir-in">↓ 入站</span>`:`<span class="dir-out">↑ 出站</span>`;
+    const host=r.host||r.dst_ip||"—";
+    return `<tr><td>${ts}</td><td>${dirLabel}</td><td>${r.src_ip||"—"}</td><td>${host}${r.dst_port?":"+r.dst_port:""}</td><td>${r.country||"—"}</td><td>${fmt((r.bytes_up||0)+(r.bytes_down||0))}</td></tr>`;
   }).join("");
   document.getElementById("live-content").innerHTML=`
-  <div class="chart-card">
-    <h2>最近 100 条连接 <span style="color:#475569;font-weight:400;font-size:.75rem">(每30秒刷新)</span></h2>
+  <div class="chart-card"><h3>最近 100 条连接 <span style="font-weight:400;font-size:.72rem;color:var(--text-muted)">(每30秒刷新)</span></h3>
     <div style="overflow-x:auto">
     <table><thead><tr><th>时间</th><th>方向</th><th>来源 IP</th><th>目标 域名/IP</th><th>国家</th><th>流量</th></tr></thead>
-    <tbody>${tbody||"<tr><td colspan=6 style='color:#475569;text-align:center;padding:20px'>暂无数据，采集器正在收集中...</td></tr>"}</tbody>
+    <tbody>${tbody||`<tr><td colspan="6" style="text-align:center;color:var(--text-muted);padding:20px">暂无数据，采集器正在收集中...</td></tr>`}</tbody>
     </table></div>
   </div>`;
 }
-
-// 初始加载
-loadTab("overview");
-setInterval(()=>loadTab(activeTab), 30000);
+async function initApp(){loadTab("overview");setInterval(()=>loadTab(activeTab),30000);}
+(async function(){if(_tok&&await checkAuth()){document.getElementById("login-overlay").style.display="none";initApp();}})();
 </script>
 </body></html>"""
 
 class Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self, fmt, *args): pass
 
+    def _check_auth(self):
+        if not TOKEN:
+            return True
+        auth = self.headers.get("Authorization", "")
+        if not auth.startswith("Bearer "):
+            return False
+        return hmac.compare_digest(auth[7:].encode(), TOKEN.encode())
+
+    def do_POST(self):
+        if self.path == "/auth":
+            length = int(self.headers.get("Content-Length", 0))
+            try:
+                body = json.loads(self.rfile.read(length))
+                pwd = body.get("password", "")
+            except Exception:
+                pwd = ""
+            if TOKEN and hmac.compare_digest(pwd.encode(), TOKEN.encode()):
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"token": TOKEN}).encode())
+            else:
+                self.send_response(401)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b'{"error":"invalid password"}')
+        else:
+            self.send_response(404)
+            self.end_headers()
+
     def do_GET(self):
         parsed = urllib.parse.urlparse(self.path)
         qs = urllib.parse.parse_qs(parsed.query)
-        if TOKEN and qs.get("token", [""])[0] != TOKEN:
-            self.send_response(401)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.end_headers()
-            self.wfile.write(b"<html><body style='background:#0f172a;color:#e2e8f0;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;'><h2>401 - Access Denied</h2></body></html>")
-            return
         path = parsed.path
-        if path == "/api":           self._api_vnstat()
-        elif path == "/api/flows/summary":  self._api_json(flows_summary(qs.get("range",["7d"])[0], qs.get("direction",[None])[0]))
-        elif path == "/api/flows/top":      self._api_json(flows_top(qs.get("field",["host"])[0], qs.get("range",["7d"])[0], qs.get("direction",[None])[0], int(qs.get("limit",["30"])[0])))
-        elif path == "/api/flows/timeline": self._api_json(flows_timeline(qs.get("range",["7d"])[0], qs.get("bucket",["day"])[0], qs.get("direction",[None])[0]))
-        elif path == "/api/flows/recent":   self._api_json(flows_recent(int(qs.get("limit",["100"])[0])))
-        else:                        self._index()
+        if path == "/" or path == "/index.html":
+            self._index(); return
+        if not self._check_auth():
+            self.send_response(401)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(b'{"error":"unauthorized"}')
+            return
+        if path == "/api":
+            self._api_vnstat()
+        elif path == "/api/flows/summary":
+            self._api_json(flows_summary(qs.get("range",["7d"])[0], qs.get("direction",[None])[0]))
+        elif path == "/api/flows/top":
+            self._api_json(flows_top(qs.get("field",["host"])[0], qs.get("range",["7d"])[0], qs.get("direction",[None])[0], int(qs.get("limit",["30"])[0])))
+        elif path == "/api/flows/timeline":
+            self._api_json(flows_timeline(qs.get("range",["7d"])[0], qs.get("bucket",["day"])[0], qs.get("direction",[None])[0]))
+        elif path == "/api/flows/recent":
+            self._api_json(flows_recent(int(qs.get("limit",["100"])[0])))
+        else:
+            self._index()
 
     def _index(self):
-        token_param = ("token=" + TOKEN) if TOKEN else ""
-        page = HTML2.replace("REPLACE_TOKEN_PARAM", token_param)
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.end_headers()
-        self.wfile.write(page.encode())
+        self.wfile.write(HTML.encode())
 
     def _api_json(self, data):
         self.send_response(200)
@@ -1825,8 +1796,8 @@ traffic_web_install() {
     local ip
     ip=$(get_ip)
     echo -e "\n${GREEN}✓ Web 面板 + 流量采集器已启动！${NC}"
-    echo -e "${BOLD}访问地址:${NC}"
-    echo -e "  ${CYAN}http://${ip}:${TRAFFIC_WEB_PORT}/?token=${token}${NC}"
+    echo -e "${BOLD}访问地址:${NC}  ${CYAN}http://${ip}:${TRAFFIC_WEB_PORT}/${NC}"
+    echo -e "${BOLD}登录密码:${NC}  ${CYAN}${token}${NC}"
     echo ""
     echo -e "${YELLOW}注意：采集器需要几分钟才能积累连接数据，实时流水标签页才会显示内容。${NC}"
     echo -e "${YELLOW}提示：建议用 nginx 反代并套 TLS 以避免明文传输密码。${NC}"
@@ -1843,7 +1814,8 @@ traffic_web_show_url() {
         return
     fi
     echo -e "\n${YELLOW}=== Web 面板访问信息 ===${NC}"
-    echo -e "地址: ${CYAN}http://${ip}:${port}/?token=${token}${NC}"
+    echo -e "地址: ${CYAN}http://${ip}:${port}/${NC}"
+    echo -e "密码: ${CYAN}${token}${NC}"
     echo -e "面板状态:   $(check_status vps-traffic-web)"
     echo -e "采集器状态: $(check_status vps-traffic-collector)"
 }
