@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # =========================================================
-# VFly - Multi-Protocol Manager V3.12
+# VFly - Multi-Protocol Manager V3.13
 # =========================================================
 
 # --- 颜色定义 ---
@@ -794,6 +794,52 @@ SCRIPT
     fi
 }
 
+_traffic_list_protocol_ports() {
+    if [[ -f "$XRAY_CONF" ]] && command -v jq &>/dev/null; then
+        jq -r '.inbounds[]? | select(.protocol == "vless" or .protocol == "vmess") | .port' "$XRAY_CONF" 2>/dev/null
+    fi
+    if [[ -f "$HY2_CONF" ]]; then
+        awk -F: '/^[[:space:]]*listen:/ {gsub(/[[:space:]]/, "", $NF); if ($NF ~ /^[0-9]+$/) print $NF; exit}' "$HY2_CONF" 2>/dev/null
+    fi
+    if [[ -f "$SNELL_CONF" ]]; then
+        awk -F: '/^[[:space:]]*listen[[:space:]]*=/ {gsub(/[[:space:]]/, "", $NF); if ($NF ~ /^[0-9]+$/) print $NF; exit}' "$SNELL_CONF" 2>/dev/null
+    fi
+}
+
+_traffic_remove_iptables_rules() {
+    command -v iptables &>/dev/null || return
+
+    while iptables -D INPUT -m conntrack --ctstate NEW -j ACCEPT 2>/dev/null; do :; done
+    while iptables -D OUTPUT -m conntrack --ctstate NEW -j ACCEPT 2>/dev/null; do :; done
+
+    local port proto
+    for port in $(_traffic_list_protocol_ports | sort -nu); do
+        for proto in tcp udp; do
+            while iptables -D INPUT -p "$proto" --dport "$port" 2>/dev/null; do :; done
+            while iptables -D OUTPUT -p "$proto" --sport "$port" 2>/dev/null; do :; done
+        done
+    done
+
+    if [[ -f /etc/iptables/rules.v4 ]] && command -v iptables-save &>/dev/null; then
+        iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
+    fi
+}
+
+_traffic_remove_conntrack_persistence() {
+    rm -f /etc/sysctl.d/99-conntrack.conf
+    if [[ -f /etc/systemd/system/iptables-restore.service ]] && \
+        grep -q "conntrack activation" /etc/systemd/system/iptables-restore.service 2>/dev/null; then
+        systemctl disable --now iptables-restore.service 2>/dev/null || true
+        rm -f /etc/systemd/system/iptables-restore.service
+    fi
+}
+
+_traffic_clear_web_conf() {
+    [[ -f "$TRAFFIC_CONF" ]] || return
+    sed -i 's/^WEB_TOKEN=.*/WEB_TOKEN=/' "$TRAFFIC_CONF" 2>/dev/null || true
+    sed -i 's/^WEB_PORT=.*/WEB_PORT=/' "$TRAFFIC_CONF" 2>/dev/null || true
+}
+
 _traffic_bytes_to_human() {
     local bytes=$1
     if (( bytes >= 1099511627776 )); then
@@ -970,6 +1016,33 @@ traffic_remove_cron() {
     echo -e "${GREEN}已移除定时告警。${NC}"
 }
 
+traffic_cli_remove() {
+    echo -e "\n${YELLOW}将卸载命令行流量监控：移除自动告警 cron，并可选删除配置与 vnStat 数据。${NC}"
+    read -p "确认继续？[y/N]: " yn
+    [[ "$yn" =~ ^[Yy]$ ]] || { echo -e "${YELLOW}已取消。${NC}"; return; }
+
+    traffic_remove_cron
+
+    if [[ -f "$TRAFFIC_CONF" ]]; then
+        if [[ -f /etc/systemd/system/vps-traffic-web.service || -d "$TRAFFIC_WEB_DIR" ]]; then
+            echo -e "${YELLOW}检测到 Web 面板可能仍在使用 ${TRAFFIC_CONF}，已保留配置文件。${NC}"
+        else
+            read -p "是否删除流量配置 ${TRAFFIC_CONF}？[y/N]: " yn
+            [[ "$yn" =~ ^[Yy]$ ]] && rm -f "$TRAFFIC_CONF"
+        fi
+    fi
+
+    if systemctl list-unit-files 2>/dev/null | grep -q '^vnstat\.service'; then
+        read -p "是否停用 vnstat 服务？[y/N]: " yn
+        [[ "$yn" =~ ^[Yy]$ ]] && systemctl disable --now vnstat 2>/dev/null
+    fi
+
+    read -p "是否删除 vnStat 历史数据库 /var/lib/vnstat？[y/N]: " yn
+    [[ "$yn" =~ ^[Yy]$ ]] && rm -rf /var/lib/vnstat
+
+    echo -e "${GREEN}命令行流量监控已卸载。${NC}"
+}
+
 manage_traffic_menu() {
     while true; do
         echo -e "\n${BLUE}--- 流量监控 ---${NC}"
@@ -978,6 +1051,7 @@ manage_traffic_menu() {
         echo "3. 设置配额与告警阈值"
         echo "4. 开启每小时自动告警 (cron)"
         echo "5. 关闭自动告警"
+        echo "6. 卸载命令行流量监控"
         echo "0. 返回主菜单"
         read -p "请选择: " OPT
         case $OPT in
@@ -986,6 +1060,7 @@ manage_traffic_menu() {
             3) traffic_set_quota ;;
             4) traffic_setup_cron ;;
             5) traffic_remove_cron ;;
+            6) traffic_cli_remove ;;
             0) break ;;
             *) echo "无效选择" ;;
         esac
@@ -2346,7 +2421,7 @@ traffic_web_install() {
         echo -e "${RED}无法检测网络接口${NC}"; return
     fi
 
-    echo -e "\n${YELLOW}=== 安装 Web 流量面板 (V3.12) ===${NC}"
+    echo -e "\n${YELLOW}=== 安装 Web 流量面板 (V3.13) ===${NC}"
     echo -e "接口: ${CYAN}${iface}${NC}  配额: ${QUOTA_GB}GB  重置日: ${RESET_DAY}日"
     echo ""
 
@@ -2440,11 +2515,18 @@ traffic_web_show_url() {
 }
 
 traffic_web_remove() {
+    echo -e "\n${YELLOW}将完整卸载 Web 面板：停止面板与采集器，删除服务、程序目录、清理 cron 和采集辅助规则。${NC}"
+    read -p "确认继续？[y/N]: " yn
+    [[ "$yn" =~ ^[Yy]$ ]] || { echo -e "${YELLOW}已取消。${NC}"; return; }
+
     systemctl disable vps-traffic-web --now 2>/dev/null
     systemctl disable vps-traffic-collector --now 2>/dev/null
+    _traffic_remove_iptables_rules
+    _traffic_remove_conntrack_persistence
     rm -f /etc/systemd/system/vps-traffic-web.service
     rm -f /etc/systemd/system/vps-traffic-collector.service
     rm -rf "$TRAFFIC_WEB_DIR"
+    _traffic_clear_web_conf
     systemctl daemon-reload
     read -p "是否同时删除历史流量数据库？[y/N]: " yn
     if [[ "$yn" =~ ^[Yy]$ ]]; then
@@ -2502,7 +2584,7 @@ manage_traffic_web_menu() {
         echo -e "5. 更新 GeoIP 数据库"
         echo -e "6. 查看采集器状态/日志"
         echo -e "7. 设置流量偏移（手动补录本月已消耗）"
-        echo -e "8. 卸载 Web 面板"
+        echo -e "8. 完整卸载 Web 面板"
         echo -e "0. 返回"
         read -p "请选择: " OPT
         case $OPT in
@@ -2525,7 +2607,7 @@ manage_traffic_web_menu() {
 main_menu() {
     while true; do
         echo -e "\n${BLUE}=====================================${NC}"
-        echo -e "   全能协议管理脚本 V3.12"
+        echo -e "   全能协议管理脚本 V3.13"
         echo -e "${BLUE}=====================================${NC}"
         echo -e "1. 安装/重置 Reality (TCP 443)  [$(check_status xray)]"
         echo -e "2. 安装/重置 Hysteria2 (UDP 443)[$(check_status hysteria-server)]"
