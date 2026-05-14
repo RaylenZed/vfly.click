@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # =========================================================
-# VFly - Multi-Protocol Manager V3.11
+# VFly - Multi-Protocol Manager V3.12
 # =========================================================
 
 # --- 颜色定义 ---
@@ -274,12 +274,14 @@ manage_reality_menu() {
     echo "2. 重启服务"
     echo "3. 停止服务"
     echo "4. 查看日志"
+    echo "5. 完整卸载 Reality"
     read -p "请选择: " OPT
     case $OPT in
         1) view_reality ;;
         2) systemctl restart xray && echo "已重启" ;;
         3) systemctl stop xray && echo "已停止" ;;
         4) journalctl -u xray -n 20 --no-pager ;;
+        5) uninstall_reality ;;
         *) echo "无效选择" ;;
     esac
 }
@@ -370,12 +372,14 @@ manage_hy2_menu() {
     echo "2. 重启服务"
     echo "3. 停止服务"
     echo "4. 查看日志"
+    echo "5. 完整卸载 Hysteria2"
     read -p "请选择: " OPT
     case $OPT in
         1) view_hy2 ;;
         2) systemctl restart hysteria-server && echo "已重启" ;;
         3) systemctl stop hysteria-server && echo "已停止" ;;
         4) journalctl -u hysteria-server -n 20 --no-pager ;;
+        5) uninstall_hy2 ;;
         *) echo "无效选择" ;;
     esac
 }
@@ -464,14 +468,132 @@ manage_snell_menu() {
     echo "2. 重启服务"
     echo "3. 停止服务"
     echo "4. 查看日志"
+    echo "5. 完整卸载 Snell"
     read -p "请选择: " OPT
     case $OPT in
         1) view_snell ;;
         2) systemctl restart snell && echo "已重启" ;;
         3) systemctl stop snell && echo "已停止" ;;
         4) journalctl -u snell -n 20 --no-pager ;;
+        5) uninstall_snell ;;
         *) echo "无效选择" ;;
     esac
+}
+
+# --- 4. 协议卸载 ---
+
+confirm_uninstall() {
+    local name="$1"
+    echo -e "\n${YELLOW}将完整卸载 ${name}：停止服务，并删除 systemd 服务、二进制文件和配置目录。${NC}"
+    read -p "确认继续？[y/N]: " yn
+    [[ "$yn" =~ ^[Yy]$ ]]
+}
+
+restart_traffic_collector_if_active() {
+    if systemctl is-active --quiet vps-traffic-collector 2>/dev/null; then
+        systemctl restart vps-traffic-collector 2>/dev/null && \
+            echo -e "${GREEN}流量采集器协议映射已刷新。${NC}"
+    fi
+}
+
+uninstall_reality() {
+    local skip_confirm="${1:-0}"
+    local remove_logs="${2:-ask}"
+    if [[ "$skip_confirm" != "1" ]]; then
+        confirm_uninstall "Reality (Xray)" || { echo -e "${YELLOW}已取消。${NC}"; return; }
+    fi
+
+    systemctl disable --now xray xray@ 2>/dev/null || true
+    rm -f /etc/systemd/system/xray.service
+    rm -f /etc/systemd/system/xray@.service
+    rm -f /lib/systemd/system/xray.service
+    rm -f /lib/systemd/system/xray@.service
+    rm -f /etc/logrotate.d/xray
+    rm -f "$XRAY_BIN"
+    rm -rf /usr/local/etc/xray
+    rm -rf /usr/local/share/xray
+    rm -rf /etc/systemd/system/xray.service.d
+    rm -rf /etc/systemd/system/xray@.service.d
+
+    if [[ "$remove_logs" == "ask" ]]; then
+        read -p "是否同时删除 Xray 日志目录 /var/log/xray？[y/N]: " yn
+        [[ "$yn" =~ ^[Yy]$ ]] && remove_logs="yes" || remove_logs="no"
+    fi
+    [[ "$remove_logs" == "yes" ]] && rm -rf /var/log/xray
+
+    systemctl daemon-reload
+    systemctl reset-failed xray xray@ 2>/dev/null || true
+    restart_traffic_collector_if_active
+    echo -e "${GREEN}Reality (Xray) 已完整卸载。${NC}"
+}
+
+uninstall_hy2() {
+    local skip_confirm="${1:-0}"
+    if [[ "$skip_confirm" != "1" ]]; then
+        confirm_uninstall "Hysteria2" || { echo -e "${YELLOW}已取消。${NC}"; return; }
+    fi
+
+    systemctl disable --now hysteria-server 2>/dev/null || true
+    rm -f /etc/systemd/system/hysteria-server.service
+    rm -f /lib/systemd/system/hysteria-server.service
+    rm -f /usr/local/bin/hysteria_server
+    rm -rf /etc/hysteria
+
+    systemctl daemon-reload
+    systemctl reset-failed hysteria-server 2>/dev/null || true
+    restart_traffic_collector_if_active
+    echo -e "${GREEN}Hysteria2 已完整卸载。${NC}"
+}
+
+uninstall_snell() {
+    local skip_confirm="${1:-0}"
+    if [[ "$skip_confirm" != "1" ]]; then
+        confirm_uninstall "Snell v5" || { echo -e "${YELLOW}已取消。${NC}"; return; }
+    fi
+
+    systemctl disable --now snell 2>/dev/null || true
+    rm -f /etc/systemd/system/snell.service
+    rm -f /lib/systemd/system/snell.service
+    rm -f /usr/local/bin/snell-server
+    rm -rf /etc/snell
+
+    systemctl daemon-reload
+    systemctl reset-failed snell 2>/dev/null || true
+    restart_traffic_collector_if_active
+    echo -e "${GREEN}Snell v5 已完整卸载。${NC}"
+}
+
+uninstall_all_protocols() {
+    confirm_uninstall "全部协议 (Reality / Hysteria2 / Snell)" || { echo -e "${YELLOW}已取消。${NC}"; return; }
+
+    local remove_logs="no"
+    read -p "是否同时删除 Xray 日志目录 /var/log/xray？[y/N]: " yn
+    [[ "$yn" =~ ^[Yy]$ ]] && remove_logs="yes"
+
+    uninstall_reality 1 "$remove_logs"
+    uninstall_hy2 1
+    uninstall_snell 1
+    echo -e "${GREEN}全部协议已卸载完成。${NC}"
+}
+
+manage_uninstall_menu() {
+    while true; do
+        echo -e "\n${BLUE}--- 完整卸载协议 ---${NC}"
+        echo "1. 卸载 Reality (Xray)"
+        echo "2. 卸载 Hysteria2"
+        echo "3. 卸载 Snell v5"
+        echo "4. 卸载全部协议"
+        echo "0. 返回"
+        read -p "请选择: " OPT
+        case $OPT in
+            1) uninstall_reality ;;
+            2) uninstall_hy2 ;;
+            3) uninstall_snell ;;
+            4) uninstall_all_protocols ;;
+            0) break ;;
+            *) echo "无效选择" ;;
+        esac
+    done
 }
 
 # --- 5. 流量监控 ---
@@ -2224,7 +2346,7 @@ traffic_web_install() {
         echo -e "${RED}无法检测网络接口${NC}"; return
     fi
 
-    echo -e "\n${YELLOW}=== 安装 Web 流量面板 (V3.11) ===${NC}"
+    echo -e "\n${YELLOW}=== 安装 Web 流量面板 (V3.12) ===${NC}"
     echo -e "接口: ${CYAN}${iface}${NC}  配额: ${QUOTA_GB}GB  重置日: ${RESET_DAY}日"
     echo ""
 
@@ -2403,7 +2525,7 @@ manage_traffic_web_menu() {
 main_menu() {
     while true; do
         echo -e "\n${BLUE}=====================================${NC}"
-        echo -e "   全能协议管理脚本 V3.11"
+        echo -e "   全能协议管理脚本 V3.12"
         echo -e "${BLUE}=====================================${NC}"
         echo -e "1. 安装/重置 Reality (TCP 443)  [$(check_status xray)]"
         echo -e "2. 安装/重置 Hysteria2 (UDP 443)[$(check_status hysteria-server)]"
@@ -2418,6 +2540,7 @@ main_menu() {
         echo -e "9. Web 流量面板"
         echo -e "-------------------------------------"
         echo -e "10. IPv6 管理 [$(ipv6_status 2>/dev/null | grep -o '已.*')]"
+        echo -e "11. 完整卸载协议"
         echo -e "0. 退出脚本"
         echo -e "${BLUE}=====================================${NC}"
         read -p "请输入选项: " CHOICE
@@ -2444,6 +2567,7 @@ main_menu() {
                     2) enable_ipv6 ;;
                 esac
                 ;;
+            11) manage_uninstall_menu ;;
             0) exit 0 ;;
             *) echo "无效选项"; sleep 1 ;;
         esac
